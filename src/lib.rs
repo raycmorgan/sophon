@@ -60,6 +60,12 @@ impl From<Swizzle> for u64 {
     }
 }
 
+impl From<(usize, usize)> for Swizzle {
+    fn from(parts: (usize, usize)) -> Self {
+        Swizzle::new(parts.0, parts.1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unswizzle(usize);
 
@@ -79,6 +85,12 @@ impl Unswizzle {
 
     fn as_u64(&self) -> u64 {
         self.0 as u64
+    }
+}
+
+impl From<(usize, usize)> for Unswizzle {
+    fn from(parts: (usize, usize)) -> Self {
+        Unswizzle::from_parts(parts.0, parts.1)
     }
 }
 

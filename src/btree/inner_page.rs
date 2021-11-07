@@ -1,5 +1,5 @@
 use crate::{Swip, Unswizzle};
-use std::io::Write;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::mem::transmute;
 use std::ops::Range;
@@ -59,20 +59,19 @@ impl<'a> InnerPage<'a> {
         debug_assert!(prefix.len() < MAX_PREFIX_LEN);
 
         let header = super::NodeType::Inner as u64;
-        
-        (&mut self.data[0..8]).write(&header.to_le_bytes()).expect("Memory write should always succeed");
-        (&mut self.data[8..16]).write(&unswizzle.as_u64().to_le_bytes()).expect("Memory write should always succeed");
-        (&mut self.data[16..64]).write(&[0u8; 48]).expect("Memory write should always succeed");
+
+        self.data[0..8].copy_from_slice(&header.to_le_bytes());
+        self.data[8..16].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
+        self.data[16..64].copy_from_slice(&[0u8; 48]);
 
         self.data[HPOS_PREFIX][0] = prefix.len() as u8;
         self.data[HPOS_PREFIX][1..1+prefix.len()].copy_from_slice(prefix);
 
         self.init(initial_version);
-        let guard = self.write_lock();
+        let mut lock = self.write_lock();
 
         // TODO: Handle error case
-        self.insert(&guard, initial_page.0, initial_page.1).unwrap();
-        self.drop_write_lock(guard);
+        lock.insert(initial_page.0, initial_page.1).unwrap();
     }
 
     /// Safety: This method assumes only one reference to the underlying data
@@ -96,8 +95,8 @@ impl<'a> InnerPage<'a> {
         // manager but is not true for standard LeanStore)
 
         // assert version is 0, though that doesn't do all that much
-        (&mut self.data[16..24]).write(&initial_version.to_le_bytes()).expect("Memory write should always succeed");
-        (&mut self.data[16..32]).write(&[0u8; 8]).expect("Memory write should always succeed");
+        self.data[16..24].copy_from_slice(&initial_version.to_le_bytes());
+        self.data[24..32].copy_from_slice(&[0u8; 8]);
     }
 
     #[inline]
@@ -106,16 +105,14 @@ impl<'a> InnerPage<'a> {
     }
 
     #[inline]
-    pub fn write_lock(&self) -> WriteGuard<'static> {
+    fn write_lock(&mut self) -> WriteLock<'a> {
         let guard = self.get_lock().write();
         self.lock_version(&guard);
-        guard
-    }
 
-    #[inline]
-    pub fn drop_write_lock(&self, guard: WriteGuard) {
-        self.unlock_version(&guard);
-        std::mem::drop(guard);
+        WriteLock {
+            guard,
+            page: self as *mut InnerPage,
+        }
     }
 
     #[inline]
@@ -168,7 +165,6 @@ impl<'a> InnerPage<'a> {
             self.slot_insert(&trimmed_key, offset as u32, unswizzle);
         }
 
-        self.incr_version(&guard);
         return Ok(());
     }
 
@@ -270,12 +266,21 @@ impl<'a> InnerPage<'a> {
 
     #[inline]
     fn lock_version(&self, _guard: &WriteGuard<'_>) {
+        // debug_assert!(self.load_version());
+
         // self.get_version().fetch_add(1, Ordering::AcqRel);
         self.get_version().fetch_or(1 << 63, Ordering::AcqRel);
     }
 
     #[inline]
-    fn unlock_version(&self, _guard: &WriteGuard<'_>) {
+    fn unlock_version(&self, guard: &WriteGuard<'_>) {
+        // We can get rid of the double atomic operations here either via
+        // a cas or by always just incrementing the version by 1 treating
+        // odds as locked. The trick with that is we need to be certain
+        // not to increment the version so it needs to be tightly tied to
+        // the locking code so there is no footgun.
+
+        self.incr_version(guard);
         self.get_version().fetch_and(u64::MAX >> 1, Ordering::AcqRel);
     }
 
@@ -388,9 +393,7 @@ impl<'a> std::fmt::Debug for InnerPage<'a> {
         }).collect();
 
         o.field("slots", &slots);
-        o.finish();
-
-        Ok(())
+        o.finish()
     }
 }
 
@@ -434,6 +437,35 @@ fn pad_right_slice<const N: usize>(input: &[u8]) -> [u8; N] {
     key_slice
 }
 
+
+struct WriteLock<'a> {
+    guard: WriteGuard<'a>,
+    page: *mut InnerPage<'a>,
+}
+
+impl<'a> WriteLock<'a> {
+    fn page(&mut self) -> &mut InnerPage<'a> {
+        unsafe { self.page.as_mut().unwrap() }
+    }
+    fn insert(&mut self, key: &[u8], unswizzle: Unswizzle) -> Result<(), InsertPageError> {
+        let page = unsafe { self.page.as_mut().unwrap() };
+        page.insert(&self.guard, key, unswizzle)
+    }
+
+    fn get(&mut self, key: &[u8]) -> Swip {
+        let page = unsafe { self.page.as_mut().unwrap() };
+        page.get(key)
+    }
+}
+
+impl<'a> Drop for WriteLock<'a> {
+    fn drop(&mut self) {
+        let page = unsafe { self.page.as_mut().unwrap() };
+        page.unlock_version(&self.guard);
+        // self.page.drop_write_lock(self.guard);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,17 +500,14 @@ mod tests {
         // let guard = page.get_lock().write();
         // page.lock_version(&guard);
 
-        let guard = page.write_lock();
+        let mut lock = page.write_lock();
         eprintln!("Header: {:?}", &page.data[0..32]);
 
         let swiz = Unswizzle::from_parts(10, 0);
 
-        page.insert(&guard, b"foo", swiz).unwrap();
-        page.insert(&guard, b"qux", Unswizzle::from_parts(11, 0)).unwrap();
-        page.insert(&guard, b"bar", Unswizzle::from_parts(12, 0)).unwrap();
-        // page.insert_page(&guard, b"bar", Unswizzle::from_parts(10, 0)).unwrap();
-        // page.incr_version(&guard);
-        // eprintln!("Body: {:?}", &page.data[64..128]);
+        lock.insert(b"foo", swiz).unwrap();
+        lock.insert(b"qux", (11, 0).into()).unwrap();
+        lock.insert(b"bar", (12, 0).into()).unwrap();
 
         assert!(page.get_lock().try_write().is_none());
         assert!(page.get_lock().try_read().is_none());
@@ -486,9 +515,35 @@ mod tests {
         assert_eq!(Swip::Unswizzle(swiz), page.get(b"fuu"));
         assert_eq!(Swip::Unswizzle(swiz), page.get(b"foo"));
 
-        page.drop_write_lock(guard);
-
         eprintln!("Header: {:?}", &page.data[0..32]);
+    }
+
+    #[test]
+    fn write_lock_v2_test() {
+        let mut buffer = [0u8; 512];
+        let mut page = InnerPage::from(&mut buffer);
+        unsafe {
+            page.bootstrap(
+                Unswizzle((213 << 7) + 1), 
+                b"",
+                (&[0u8; 4], Unswizzle::from_parts(1, 0)),
+                1
+            );
+        }
+
+        {
+            let mut lock = page.write_lock();
+            lock.insert(b"foo", (1, 0).into()).unwrap();
+
+            assert!(page.get_lock().try_read().is_none());
+
+            let version = page.load_version();
+            assert!(version & 2 == 2);
+            assert!(version & (1 << 63) > 0);
+        }
+
+        assert_eq!(3, page.load_version());
+        assert!(page.get_lock().try_read().is_some());
     }
 
     #[test]
@@ -504,14 +559,9 @@ mod tests {
             );
         }
 
-        let guard = page.write_lock();
-        let res = page.insert(
-            &guard, 
-            &[1u8; 5000], 
-            Unswizzle::from_parts(11, 0)
-        );
+        let mut lock = page.write_lock();
+        let res = lock.insert(&[1u8; 5000], (11, 0).into());
         assert_eq!(Err(InsertPageError::PageFull), res);
-        page.drop_write_lock(guard);
     }
 
     #[test]
@@ -527,23 +577,20 @@ mod tests {
             );
         }
 
-        let guard = page.write_lock();
+        let mut lock = page.write_lock();
 
         for i in 0..27 {
-            page.insert(
-                &guard, 
+            lock.insert(
                 &[i+1 as u8; 4], 
-                Unswizzle::from_parts(i as usize+1, 0)
+                (i as usize+1, 0).into()
             ).expect("to write just fine");
         }
 
-        let res = page.insert(
-            &guard, 
+        let res = lock.insert(
             &[28; 4], 
-            Unswizzle::from_parts(27, 0)
+            (27, 0).into()
         );
         assert_eq!(Err(InsertPageError::PageFull), res);
-        page.drop_write_lock(guard);
     }
 
     #[test]
@@ -559,16 +606,16 @@ mod tests {
             page.bootstrap(
                 Unswizzle((213 << 7) + 1), 
                 b"",
-                (&[0u8; 4], Unswizzle::from_parts(1, 0)),
+                (&[0u8; 4], (1, 0).into()),
                 1
             );
         }
 
-        let guard = page.write_lock();
-        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(3, 0)).unwrap();
-        page.insert(&guard, b"aaaabar", Unswizzle::from_parts(2, 0)).unwrap();
-        page.insert(&guard, b"aaaaqux", Unswizzle::from_parts(4, 0)).unwrap();
-        page.drop_write_lock(guard);
+        let mut lock = page.write_lock();
+        lock.insert(b"aaaafoo", (3, 0).into()).unwrap();
+        lock.insert(b"aaaabar", (2, 0).into()).unwrap();
+        lock.insert(b"aaaaqux", (4, 0).into()).unwrap();
+        std::mem::drop(lock);
 
         eprintln!("InnerPage: {:#?}", page);
 
@@ -592,15 +639,15 @@ mod tests {
             page.bootstrap(
                 Unswizzle((213 << 7) + 1), 
                 b"",
-                (&[0u8; 4], Unswizzle::from_parts(1, 0)),
+                (&[0u8; 4], (1, 0).into()),
                 1
             );
         }
 
-        let guard = page.write_lock();
-        page.insert(&guard, b"bar", Unswizzle::from_parts(2, 0)).unwrap();
-        page.insert(&guard, b"qux", Unswizzle::from_parts(3, 0)).unwrap();
-        page.drop_write_lock(guard);
+        let mut lock = page.write_lock();
+        lock.insert(b"bar", (2, 0).into()).unwrap();
+        lock.insert(b"qux", (3, 0).into()).unwrap();
+        std::mem::drop(lock);
 
         assert_eq!(1, page.get(b"").page_id());
         assert_eq!(1, page.get(b"a").page_id());
@@ -622,15 +669,14 @@ mod tests {
             page.bootstrap(
                 Unswizzle((213 << 7) + 1), 
                 b"",
-                (&[0u8; 4], Unswizzle::from_parts(1, 0)),
+                (&[0u8; 4], (1, 0).into()),
                 1
             );
         }
 
-        let guard = page.write_lock();
-        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(2, 0)).unwrap();
-        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(3, 0)).unwrap();
-        page.drop_write_lock(guard);
+        let mut lock = page.write_lock();
+        lock.insert(b"aaaafoo", (2, 0).into()).unwrap();
+        lock.insert(b"aaaafoo", (3, 0).into()).unwrap();
 
         assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(3, 0)), page.get(b"aaaafoo"));
     }
