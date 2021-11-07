@@ -88,6 +88,15 @@ enum Swip {
     Unswizzle(Unswizzle),
 }
 
+impl Swip {
+    fn page_id(&self) -> usize {
+        match self {
+            Swip::Swizzle(s) => s.page_id(),
+            Swip::Unswizzle(s) => s.page_id(),
+        }
+    }
+}
+
 impl From<u64> for Swip {
     fn from(data: u64) -> Self {
         if data & 1 == 1 {

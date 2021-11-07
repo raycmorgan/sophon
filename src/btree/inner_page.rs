@@ -1,4 +1,4 @@
-use crate::{Swip, Swizzle, Unswizzle};
+use crate::{Swip, Unswizzle};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::mem::transmute;
@@ -71,7 +71,7 @@ impl<'a> InnerPage<'a> {
         let guard = self.write_lock();
 
         // TODO: Handle error case
-        self.insert_page(&guard, initial_page.0, initial_page.1).unwrap();
+        self.insert(&guard, initial_page.0, initial_page.1).unwrap();
         self.drop_write_lock(guard);
     }
 
@@ -123,15 +123,12 @@ impl<'a> InnerPage<'a> {
         self.get_version().load(Ordering::Acquire)
     }
 
-    pub fn insert_page(&mut self, guard: &WriteGuard<'_>, key: &[u8], unswizzle: Unswizzle) -> Result<(), InsertPageError> {
+    pub fn insert(&mut self, guard: &WriteGuard<'_>, key: &[u8], unswizzle: Unswizzle) -> Result<(), InsertPageError> {
         // 0. Do we have space?
         // 1. Get and update tail pos
         // 2. Insert 4 byte key in header, offset of tail pos
         // 2. Incr key count
         // 4. Insert at tail pos: suffix
-
-        // TODO: check for space
-
         let prefix = read_u8_len_bytes(&self.data[HPOS_PREFIX]);
         if &key[..prefix.len()] != prefix {
             return Err(InsertPageError::IncorrectPrefix);
@@ -175,7 +172,7 @@ impl<'a> InnerPage<'a> {
         return Ok(());
     }
 
-    pub fn get_containing_page(&self, key: &[u8]) -> Swip {
+    pub fn get(&self, key: &[u8]) -> Swip {
         #[cfg(debug_assertions)] {
             let prefix = read_u8_len_bytes(&self.data[HPOS_PREFIX]);
             debug_assert!(&key[..prefix.len()] == prefix);
@@ -188,14 +185,24 @@ impl<'a> InnerPage<'a> {
         swip
     }
 
+    #[inline]
     fn slot_range_for_idx(&self, idx: usize) -> Range<usize> {
-        (idx*SLOT_WIDTH+64..idx*SLOT_WIDTH+64+SLOT_WIDTH)
+        idx*SLOT_WIDTH+64..idx*SLOT_WIDTH+64+SLOT_WIDTH
     }
 
+    #[inline]
     fn search_position(&self, key: &[u8]) -> usize {
         // Non-exact means we overshot the position, so need to
         // move back one.
         self.search_slots(key).unwrap_or_else(|i| i - 1)
+    }
+
+    #[inline]
+    fn find_slot_pos(&self, key: &[u8]) -> FindSlot {
+        match self.search_slots(key) {
+            Ok(i) => FindSlot::Replace(i),
+            Err(i) => FindSlot::Insert(i),
+        }
     }
 
     fn search_slots(&self, key: &[u8]) -> Result<usize, usize> {
@@ -231,32 +238,6 @@ impl<'a> InnerPage<'a> {
 
             return Ordering::Greater;
         })
-
-
-        // slots.partition_point(|slot| {
-        //     // let pos = i * SLOT_WIDTH;
-        //     // let slot = &slots_data[pos..pos+SLOT_WIDTH];
-            
-        //     if &slot_key[..] > &slot[0..4] {
-        //         return true;
-        //     }
-
-        //     if &slot_key[..] == &slot[0..4] {
-        //         if slot[4..8] == [0u8; 4] { // no overflow
-        //             return true;
-        //         } else {
-        //             let suffix_offset = read_u32(&slot[4..8]) as usize;
-        //             let len = read_u16(&self.data[suffix_offset..suffix_offset+2]) as usize;
-        //             let suffix_slice = &self.data[suffix_offset+2..suffix_offset+2+len];
-
-        //             if &key[prefix_len+4..] >= suffix_slice {
-        //                 return true;
-        //             }
-        //         }
-        //     }
-
-        //     false
-        // })
     }
 
     // ---- //
@@ -317,43 +298,6 @@ impl<'a> InnerPage<'a> {
     #[inline]
     fn set_slot_len(&mut self, len: u32) {
         self.data[HPOS_SLOT_LEN].copy_from_slice(&len.to_le_bytes());
-    }
-
-    #[inline]
-    fn find_slot_pos(&self, key: &[u8]) -> FindSlot {
-        match self.search_slots(key) {
-            Ok(i) => FindSlot::Replace(i),
-            Err(i) => FindSlot::Insert(i),
-        }
-
-        // let slot_len = read_u32(&self.data[HPOS_SLOT_LEN]) as usize;
-        // let slots_data = &self.data[64..64+(SLOT_WIDTH * slot_len)];
-        // let key_slice = pad_right_slice::<4>(&key[..]);
-
-        // for (i, slot) in slots_data.chunks_exact(16).enumerate() {
-        //     if &key_slice[..] < &slot[0..4] {
-        //         return FindSlot::Insert(i);
-        //     }
-
-        //     if &key_slice[..] == &slot[0..4] {
-        //         if &slot[4..8] != &[0u8; 4] {
-        //             let overflow_offset = read_u32(&slot[4..8]) as usize;
-        //             let overflow = read_u16_len_bytes(&self.data[overflow_offset..]);
-
-        //             match &key[4..].cmp(overflow) {
-        //                 std::cmp::Ordering::Less => return FindSlot::Insert(i),
-        //                 std::cmp::Ordering::Equal => return FindSlot::Replace(i),
-        //                 std::cmp::Ordering::Greater => ()
-        //             };
-        //         } else {
-        //             if key.len() == 4 {
-        //                 return FindSlot::Replace(i);
-        //             }
-        //         }
-        //     }
-        // }
-
-        // FindSlot::Insert(slots_data.len() / 16)
     }
 
     #[inline]
@@ -529,9 +473,9 @@ mod tests {
 
         let swiz = Unswizzle::from_parts(10, 0);
 
-        page.insert_page(&guard, b"foo", swiz).unwrap();
-        page.insert_page(&guard, b"qux", Unswizzle::from_parts(11, 0)).unwrap();
-        page.insert_page(&guard, b"bar", Unswizzle::from_parts(12, 0)).unwrap();
+        page.insert(&guard, b"foo", swiz).unwrap();
+        page.insert(&guard, b"qux", Unswizzle::from_parts(11, 0)).unwrap();
+        page.insert(&guard, b"bar", Unswizzle::from_parts(12, 0)).unwrap();
         // page.insert_page(&guard, b"bar", Unswizzle::from_parts(10, 0)).unwrap();
         // page.incr_version(&guard);
         // eprintln!("Body: {:?}", &page.data[64..128]);
@@ -539,8 +483,8 @@ mod tests {
         assert!(page.get_lock().try_write().is_none());
         assert!(page.get_lock().try_read().is_none());
 
-        assert_eq!(Swip::Unswizzle(swiz), page.get_containing_page(b"fuu"));
-        assert_eq!(Swip::Unswizzle(swiz), page.get_containing_page(b"foo"));
+        assert_eq!(Swip::Unswizzle(swiz), page.get(b"fuu"));
+        assert_eq!(Swip::Unswizzle(swiz), page.get(b"foo"));
 
         page.drop_write_lock(guard);
 
@@ -561,7 +505,7 @@ mod tests {
         }
 
         let guard = page.write_lock();
-        let res = page.insert_page(
+        let res = page.insert(
             &guard, 
             &[1u8; 5000], 
             Unswizzle::from_parts(11, 0)
@@ -586,14 +530,14 @@ mod tests {
         let guard = page.write_lock();
 
         for i in 0..27 {
-            page.insert_page(
+            page.insert(
                 &guard, 
                 &[i+1 as u8; 4], 
                 Unswizzle::from_parts(i as usize+1, 0)
             ).expect("to write just fine");
         }
 
-        let res = page.insert_page(
+        let res = page.insert(
             &guard, 
             &[28; 4], 
             Unswizzle::from_parts(27, 0)
@@ -608,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn inserting_pages_with_same_key_prefix() {
+    fn inserting_pages_with_same_slot_prefix() {
         let mut buffer = [0u8; 512];
         let mut page = InnerPage::from(&mut buffer);
         unsafe {
@@ -621,19 +565,53 @@ mod tests {
         }
 
         let guard = page.write_lock();
-        let swiz = Unswizzle::from_parts(2, 0);
-
-        page.insert_page(&guard, b"aaaafoo", swiz).unwrap();
-        page.insert_page(&guard, b"aaaabar", Unswizzle::from_parts(3, 0)).unwrap();
-        page.insert_page(&guard, b"aaaaqux", Unswizzle::from_parts(4, 0)).unwrap();
+        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(3, 0)).unwrap();
+        page.insert(&guard, b"aaaabar", Unswizzle::from_parts(2, 0)).unwrap();
+        page.insert(&guard, b"aaaaqux", Unswizzle::from_parts(4, 0)).unwrap();
         page.drop_write_lock(guard);
 
         eprintln!("InnerPage: {:#?}", page);
 
-        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(1, 0)), page.get_containing_page(b"aaaa"));
-        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(3, 0)), page.get_containing_page(b"aaaabb"));
-        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(2, 0)), page.get_containing_page(b"aaaafp"));
-        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(4, 0)), page.get_containing_page(b"aaaaqz"));
+        assert_eq!(1, page.get(b"aaaa").page_id());
+        assert_eq!(2, page.get(b"aaaabb").page_id());
+        assert_eq!(2, page.get(b"aaaafo").page_id());
+        assert_eq!(3, page.get(b"aaaafp").page_id());
+        assert_eq!(3, page.get(b"aaaafoo").page_id());
+        assert_eq!(3, page.get(b"aaaafood").page_id());
+        assert_eq!(3, page.get(b"aaaaqu").page_id());
+        assert_eq!(4, page.get(b"aaaaqux").page_id());
+        assert_eq!(4, page.get(b"aaaaquxxxx").page_id());
+        assert_eq!(4, page.get(b"aaaaqz").page_id());
+    }
+
+    #[test]
+    fn insert_and_get() {
+        let mut buffer = [0u8; 512];
+        let mut page = InnerPage::from(&mut buffer);
+        unsafe {
+            page.bootstrap(
+                Unswizzle((213 << 7) + 1), 
+                b"",
+                (&[0u8; 4], Unswizzle::from_parts(1, 0)),
+                1
+            );
+        }
+
+        let guard = page.write_lock();
+        page.insert(&guard, b"bar", Unswizzle::from_parts(2, 0)).unwrap();
+        page.insert(&guard, b"qux", Unswizzle::from_parts(3, 0)).unwrap();
+        page.drop_write_lock(guard);
+
+        assert_eq!(1, page.get(b"").page_id());
+        assert_eq!(1, page.get(b"a").page_id());
+        assert_eq!(1, page.get(b"b").page_id());
+        assert_eq!(1, page.get(b"baa").page_id());
+        assert_eq!(2, page.get(b"bar").page_id());
+        assert_eq!(2, page.get(b"barbar").page_id());
+        assert_eq!(2, page.get(b"bars").page_id());
+        assert_eq!(3, page.get(b"qux").page_id());
+        assert_eq!(3, page.get(b"quz").page_id());
+        assert_eq!(3, page.get(&[255, 255, 255, 255]).page_id());
     }
 
     #[test]
@@ -650,10 +628,10 @@ mod tests {
         }
 
         let guard = page.write_lock();
-        page.insert_page(&guard, b"aaaafoo", Unswizzle::from_parts(2, 0)).unwrap();
-        page.insert_page(&guard, b"aaaafoo", Unswizzle::from_parts(3, 0)).unwrap();
+        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(2, 0)).unwrap();
+        page.insert(&guard, b"aaaafoo", Unswizzle::from_parts(3, 0)).unwrap();
         page.drop_write_lock(guard);
 
-        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(3, 0)), page.get_containing_page(b"aaaafoo"));
+        assert_eq!(Swip::Unswizzle(Unswizzle::from_parts(3, 0)), page.get(b"aaaafoo"));
     }
 }
