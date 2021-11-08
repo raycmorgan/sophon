@@ -33,10 +33,14 @@ const HPOS_FREED_SUFFIX_LEN: Range<usize> = 36..40;
 const HPOS_PREFIX: Range<usize> = 44..64;
 const MAX_PREFIX_LEN: usize = HPOS_PREFIX.end - HPOS_PREFIX.start - 1;
 
-const SLOT_WIDTH: usize = 16;
+const SLOT_WIDTH: usize = 8;
 //
 // Slots: [prefix: 4][suffix offset: 4][page pointer: 8]
 // Tails: [len: 2][suffix: len] or [len: 2][next free offset: 4]
+
+
+// Slots: [prefix: 4][overflow ptr: 4]
+// Overflow: [suffix_len: 2][suffix: len][data_len: 2][data: data_len]
 
 type ReadGuard<'a> = parking_lot::lock_api::RwLockReadGuard<'a, parking_lot::RawRwLock, ()>;
 type WriteGuard<'a> = parking_lot::lock_api::RwLockWriteGuard<'a, parking_lot::RawRwLock, ()>;
@@ -143,27 +147,27 @@ impl<'a> InnerPage<'a> {
         // let additional_slot_requirement
         let current_suffix_storage = self.data.len() - suffix_pointer;
 
-        if trimmed_key.len() <= 4 {
-            if current_slot_len + header_len + 16 > current_suffix_storage {
-                return Err(InsertPageError::PageFull);
-            }
+        let key_overflow_len = trimmed_key.len().checked_sub(4).unwrap_or(0);
+        let overflow_width = 4 + key_overflow_len + 4 + std::mem::size_of::<Unswizzle>();
 
-            // no need for suffix storage
-            self.slot_insert(&trimmed_key, 0, unswizzle);
-        } else {
-            if current_slot_len + header_len + 12 + 2 + trimmed_key.len() > current_suffix_storage {
-                return Err(InsertPageError::PageFull);
-            }
-            // need suffix storage
-            // let tail_pos = self.fetch_update_tail_pos(, guard)
-            let overflow_width = trimmed_key.len() - 4;
-            let pos = self.fetch_update_suffix_pos(guard, overflow_width) as usize;
-            let offset = self.data.len() - pos;
-
-            self.data[offset..offset+2].copy_from_slice(&(overflow_width as u16).to_le_bytes());
-            self.data[offset+2..offset+2+overflow_width].copy_from_slice(&trimmed_key[4..]);
-            self.slot_insert(&trimmed_key, offset as u32, unswizzle);
+        if current_slot_len + header_len + SLOT_WIDTH + overflow_width > current_suffix_storage {
+            return Err(InsertPageError::PageFull);
         }
+
+        let overflow_pos = self.fetch_update_suffix_pos(guard, overflow_width) as usize;
+        let overflow = self.data.len() - overflow_pos;
+
+        self.data[overflow..overflow+4].copy_from_slice(&(key_overflow_len as u32).to_le_bytes());
+
+        if key_overflow_len > 0 {
+            self.data[overflow+4..overflow+4+key_overflow_len].copy_from_slice(&trimmed_key[4..]);
+        }
+
+        let data_ptr = overflow+4+key_overflow_len;
+        self.data[data_ptr..data_ptr+4].copy_from_slice(&(std::mem::size_of::<Unswizzle>() as u32).to_le_bytes());
+        self.data[data_ptr+4..data_ptr+4+std::mem::size_of::<Unswizzle>()].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
+
+        self.slot_insert(trimmed_key, overflow as u32);
 
         return Ok(());
     }
@@ -177,8 +181,16 @@ impl<'a> InnerPage<'a> {
         let pos = self.search_position(&key);
         let slot = &self.data[self.slot_range_for_idx(pos)];
 
-        let swip: Swip = read_u64(&slot[8..16]).into();
+        let overflow = read_u32(&slot[4..8]) as usize;
+        let suffix_len = read_u32(&self.data[overflow..overflow+4]) as usize;
+        let swip: Swip = read_u64(read_u32_len_bytes(&self.data[overflow+4+suffix_len..])).into();
+
         swip
+    }
+
+    #[inline]
+    fn ptr_len(&self) -> usize {
+        if self.data.len() <= 65536 { 2 } else { 4 }
     }
 
     #[inline]
@@ -217,18 +229,20 @@ impl<'a> InnerPage<'a> {
         slots.binary_search_by(|slot| {
             use std::cmp::Ordering;
 
+            // TODO: I think there is a way to remove the slot_key and use slices directly
+
             if &slot_key[..] > &slot[0..4] {
                 return Ordering::Less;
             }
 
             if &slot_key[..] == &slot[0..4] {
-                if slot[4..8] == [0u8; 4] { // no overflow
+                let suffix_offset = read_u32(&slot[4..8]) as usize;
+                let suffix_slice = read_u32_len_bytes(&self.data[suffix_offset..]);
+
+                if key.len() <= 4 && suffix_slice.len() == 0 {
                     return Ordering::Equal;
                 } else {
-                    let suffix_offset = read_u32(&slot[4..8]) as usize;
-                    let suffix_slice = read_u16_len_bytes(&self.data[suffix_offset..]);
-
-                    return suffix_slice.cmp(&key[prefix_len+4..]);
+                    return suffix_slice.cmp(&key[4..]);
                 }
             }
 
@@ -291,7 +305,7 @@ impl<'a> InnerPage<'a> {
 
     #[inline]
     fn fetch_update_suffix_pos(&mut self, _guard: &WriteGuard<'_>, item_width: usize) -> u32 {
-        let width = item_width + 2; // 2 for len of item
+        let width = item_width; // 2 for len of item
         let tail_pos = read_u32(&self.data[HPOS_SUFFIX_POINTER]);
         let updated_tail_pos = tail_pos + width as u32;
 
@@ -306,7 +320,7 @@ impl<'a> InnerPage<'a> {
     }
 
     #[inline]
-    fn slot_insert(&mut self, key: &[u8], suffix_offset: u32, unswizzle: Unswizzle) {
+    fn slot_insert(&mut self, key: &[u8], suffix_offset: u32) {
         // let idx = self.find_slot_pos(&key);
         let slot_len = read_u32(&self.data[HPOS_SLOT_LEN]) as usize;
         let cur_slot_end = SLOT_WIDTH * slot_len;
@@ -314,23 +328,25 @@ impl<'a> InnerPage<'a> {
 
         match self.find_slot_pos(&key) {
             FindSlot::Insert(idx) => {
-                let extended_slots_data = &mut self.data[64..64+cur_slot_end+16];
-                let start = idx * 16;
+                let extended_slots_data = &mut self.data[64..64+cur_slot_end+SLOT_WIDTH];
+                let start = idx * SLOT_WIDTH;
 
                 // eprintln!("start: {}, cur_slot_end: {}, extended_slots_data.len: {}", start, cur_slot_end, extended_slots_data.len());
-                extended_slots_data.copy_within(start..cur_slot_end, start+16);
+                extended_slots_data.copy_within(start..cur_slot_end, start+SLOT_WIDTH);
 
                 extended_slots_data[start..start+4].copy_from_slice(&slot_key);
                 extended_slots_data[start+4..start+8].copy_from_slice(&suffix_offset.to_le_bytes());
 
                 // eprintln!("unswizzle: {}", unswizzle.as_u64());
-                extended_slots_data[start+8..start+16].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
+
+                // todo!("Move to data [Insert]");
+                // extended_slots_data[start+8..start+16].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
 
                 self.set_slot_len(slot_len as u32 + 1);
             }
 
             FindSlot::Replace(idx) => {
-                let start = idx * 16 + 64;
+                let start = idx * SLOT_WIDTH + 64;
 
                 if self.data[start+4..start+8] != [0u8; 4] {
                     let overflow_ptr = read_u32(&self.data[start+4..start+8]) as usize;
@@ -342,7 +358,9 @@ impl<'a> InnerPage<'a> {
 
                 self.data[start..start+4].copy_from_slice(&slot_key);
                 self.data[start+4..start+8].copy_from_slice(&suffix_offset.to_le_bytes());
-                self.data[start+8..start+16].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
+
+                // todo!("Move to data [Replace]");
+                // self.data[start+8..start+16].copy_from_slice(&unswizzle.as_u64().to_le_bytes());
             }
         }
     }
@@ -376,13 +394,15 @@ impl<'a> std::fmt::Debug for InnerPage<'a> {
             }
         }
 
-        let slots: Vec<SlotData> = slots_data.chunks_exact(16).map(|slot| {
+        let slots: Vec<SlotData> = slots_data.chunks_exact(SLOT_WIDTH).map(|slot| {
             let slot_key = &slot[0..4];
             let slot_offset = read_u32(&slot[4..8]);
-            let swip: Swip = read_u64(&slot[8..16]).into();
+            // let swip: Swip = read_u64(&slot[8..16]).into();
 
             let so = slot_offset as usize;
-            let overflow_data = read_u16_len_bytes(&self.data[so..]);
+            let overflow_data = read_u32_len_bytes(&self.data[so..]);
+
+            let swip: Swip = read_u64(read_u32_len_bytes(&self.data[so+4+overflow_data.len()..])).into();
 
             SlotData {
                 slot_key,
@@ -579,16 +599,18 @@ mod tests {
 
         let mut lock = page.write_lock();
 
-        for i in 0..27 {
+        let max_entries = (512 - 64) / (SLOT_WIDTH + 16) - 1;
+
+        for i in 0..max_entries {
             lock.insert(
-                &[i+1 as u8; 4], 
+                &[(i+1) as u8; 4], 
                 (i as usize+1, 0).into()
             ).expect("to write just fine");
         }
 
         let res = lock.insert(
-            &[28; 4], 
-            (27, 0).into()
+            &[max_entries as u8; 4], 
+            (max_entries, 0).into()
         );
         assert_eq!(Err(InsertPageError::PageFull), res);
     }
@@ -648,6 +670,8 @@ mod tests {
         lock.insert(b"bar", (2, 0).into()).unwrap();
         lock.insert(b"qux", (3, 0).into()).unwrap();
         std::mem::drop(lock);
+
+        eprintln!("Page: {:#?}", page);
 
         assert_eq!(1, page.get(b"").page_id());
         assert_eq!(1, page.get(b"a").page_id());
