@@ -280,7 +280,7 @@ impl<'a> Page<'a> {
         if exact { Ok(data) } else { Err(data) }
     }
 
-    pub(crate) fn scan(self, range: &Range<&'a [u8]>) -> PageIter<'a> {
+    pub(crate) fn scan(self, range: Range<&'a [u8]>) -> PageIter<'a> {
         PageIter::new(self)
     }
 
@@ -568,6 +568,7 @@ fn pad_right_slice<const N: usize>(input: &[u8]) -> [u8; N] {
 pub(crate) struct PageIter<'a> {
     page: Page<'a>,
     lock: ReadGuard<'static>,
+    pub(crate) last_key: Option<PageIterKey<'a>>,
 }
 
 impl<'a> PageIter<'a> {
@@ -582,6 +583,7 @@ impl<'a> PageIter<'a> {
         PageIter {
             page,
             lock,
+            last_key: None,
         }
     }
 
@@ -598,13 +600,18 @@ impl<'a> Iterator for PageIter<'a> {
     }
 }
 
-// struct PageIterKey<'a> {
-//     prefix: &'a [u8],
-//     slot: &'a [u8],
-//     suffix: &'a [u8],
-// }
+#[derive(Clone)]
+pub(crate) struct PageIterKey<'a>(
+    pub(crate) &'a [u8],
+    pub(crate) &'a [u8],
+    pub(crate) &'a [u8]
+);
 
-pub(crate) struct PageIterKey<'a>(&'a [u8], &'a [u8], &'a [u8]);
+impl<'a> PageIterKey<'a> {
+    pub(crate) fn len(&self) -> usize {
+        self.0.len() + self.1.len() + self.2.len()
+    }
+}
 
 pub(crate) struct WriteLock<'a> {
     guard: WriteGuard<'a>,
@@ -640,6 +647,8 @@ impl<'a> Drop for WriteLock<'a> {
         // self.page.drop_write_lock(self.guard);
     }
 }
+
+struct KeySlice<'a>(&'a [&'a [u8]]);
 
 #[cfg(test)]
 mod tests {

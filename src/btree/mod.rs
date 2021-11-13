@@ -8,6 +8,7 @@ use crate::{DiskManager, DiskManagerAllocError, Unswizzle, Swip, buffer_manager}
 // use crate::buffer_manager::Page;
 
 mod page;
+mod node;
 
 // const NODE_TYPE_INNER: u64 = 1;
 // const NODE_TYPE_LEAF: u64 = 1 << 1;
@@ -168,51 +169,81 @@ impl<'a, D: DiskManager> BTree<'a, D> {
 use page::PageIterKey;
 
 struct ScanIterator<'a, T: DiskManager> {
-    btree: BTree<'a, T>,
-    cursor: Range<&'a [u8]>,
-    sub_iter: Option<PageIter<'a>>,
+    btree: &'a BTree<'a, T>,
+    range: Range<&'a [u8]>,
+    leaf: Option<Page<'a>>,
+}
+
+impl<'a, T: DiskManager> ScanIterator<'a, T> {
+    fn new(btree: &'a BTree<'a, T>, range: Range<&'a [u8]>) -> Self {
+        ScanIterator {
+            btree,
+            range,
+            leaf: None,
+        }
+    }
 }
 
 impl<'a, T: DiskManager> Iterator for ScanIterator<'a, T> {
     type Item = (PageIterKey<'a>, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.sub_iter.is_some() {
-            let sub_iter = self.sub_iter.as_mut().unwrap();
+        unimplemented!()
 
-            // TODO: Need to pass through key as (prefix, slot, suffix). This
-            // avoids copies.
+        // if self.sub_iter.is_some() {
+        //     let sub_iter = self.sub_iter.as_mut().unwrap();
 
-            let next = sub_iter.next();
+        //     // TODO: Need to pass through key as (prefix, slot, suffix). This
+        //     // avoids copies.
 
-            if next.is_some() {
-                return next;
-            } else {
-                self.sub_iter.take();
-            }
-        }
+        //     let next = sub_iter.next();
 
-        loop {
-            let page = match self.btree.search_to_leaf(&self.cursor.start, None) {
-                Ok(p) => p,
-                Err(SearchError::OptimisticConflict) => continue,
-            };
+        //     if next.is_some() {
+        //         return next;
+        //     } else {
+        //         let iter = self.sub_iter.take().unwrap();
+        //         let next_key = iter.last_key.unwrap();
 
-            // let pre_version = match page.version() {
-            //     Ok(v) => v,
-            //     Err(_) => continue,
-            // };
+        //         // HEAP ALLOC :(
+        //         let mut next_page_key = vec![0u8; next_key.len() + 1];
+        //         let mut c = 0;
+                
+        //         next_page_key[c..next_key.0.len()].copy_from_slice(next_key.0);
+        //         c += next_key.0.len();
 
-            let sub_iter = page.scan(&self.cursor);
-            // page.read_lock();
-            self.sub_iter = Some(sub_iter);
+        //         next_page_key[c..c+next_key.1.len()].copy_from_slice(next_key.1);
+        //         c += next_key.1.len();
 
-            // let lock = page.read_lock();
-            // self.sub_iter = Some(page.scan(self.cursor));
-            // self.sub_iter_lock = lock;
+        //         next_page_key[c..c+next_key.2.len()].copy_from_slice(next_key.2);
+        //         c += next_key.2.len();
 
-            todo!("need to implement page.scan")
-        }
+        //         self.lower_fence = next_page_key;
+        //     }
+        // }
+
+        // loop {
+        //     let page = match self.btree.search_to_leaf(&self.lower_fence, None) {
+        //         Ok(p) => p,
+        //         Err(SearchError::OptimisticConflict) => continue,
+        //     };
+
+        //     // let pre_version = match page.version() {
+        //     //     Ok(v) => v,
+        //     //     Err(_) => continue,
+        //     // };
+
+        //     // let range = &self.lower_fence[..]..self.range.end;
+
+        //     // let sub_iter = page.scan(range);
+        //     // page.read_lock();
+        //     // self.sub_iter = Some(sub_iter);
+
+        //     // let lock = page.read_lock();
+        //     // self.sub_iter = Some(page.scan(self.cursor));
+        //     // self.sub_iter_lock = lock;
+
+        //     todo!("need to implement page.scan")
+        // }
 
         
 
