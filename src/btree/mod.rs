@@ -1,15 +1,20 @@
+use std::io::IntoInnerError;
+use std::ops::Range;
 use std::path::PathBuf;
 use byte_unit::{n_kib_bytes, n_mib_bytes};
 
+use crate::{DiskManager, DiskManagerAllocError, Unswizzle, Swip, buffer_manager};
+
 // use crate::buffer_manager::Page;
 
-mod inner_page;
+mod page;
 
 // const NODE_TYPE_INNER: u64 = 1;
 // const NODE_TYPE_LEAF: u64 = 1 << 1;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u64)]
-enum NodeType {
+pub(crate) enum NodeType {
     // 0bxx represents node type
     Inner = 0b0001,
     Leaf  = 0b0010,
@@ -30,10 +35,240 @@ impl TryFrom<&[u8]> for NodeType {
     }
 }
 
-trait BTree {
-    fn new();
-    fn from_file();
+use crate::buffer_manager::BufferManager;
+use page::Page;
+
+use self::page::PageIter;
+
+struct BTree<'a, D: DiskManager> {
+    buffer_manager: &'a BufferManager<D>,
+    root_page: Page<'a>,
 }
+
+impl<'a, D: DiskManager> BTree<'a, D> {
+    pub fn from(buffer_manager: &'a BufferManager<D>, root_page: &'a mut [u8]) -> Self {
+        let mut root_page = Page::from(root_page);
+
+        let initial_version = buffer_manager.version_boundary();
+        unsafe { root_page.init(initial_version) };
+
+        BTree {
+            buffer_manager,
+            root_page,
+        }
+    }
+
+    pub fn bootstrap(buffer_manager: &'a BufferManager<D>, data: (Unswizzle, &'a mut [u8])) -> Result<Self, DiskManagerAllocError> {
+        let mut root_page = Page::from(data.1);
+        let initial_version = buffer_manager.version_boundary();
+
+        unsafe {
+            let leaf_data = buffer_manager.new_page()?;
+            let mut leaf_page = Page::from(leaf_data.1);
+            leaf_page.bootstrap_leaf(leaf_data.0.into(), &[], initial_version);
+            root_page.bootstrap_inner(data.0, &[], (b"", leaf_data.0), initial_version);
+        }
+
+        Ok(BTree {
+            buffer_manager,
+            root_page,
+        })
+    }
+
+    pub fn insert(&self, key: &[u8], value: &[u8]) {
+        let res = self.search_to_leaf(key, None)
+            .and_then(|mut p| {
+                p.write_lock().map_err(|e| e.into())
+            });
+
+        let mut lock = match res {
+            Ok(l) => l,
+            Err(e) => todo!("Handle err case: {:?}", e),
+        };
+
+        match lock.insert(key, value) {
+            Ok(()) => (),
+            Err(e) => {
+                todo!("We need to handle error cases! {:?}", e);
+            }
+        }   
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        loop {
+            match self.get_(key) {
+                Ok(r) => return r,
+                Err(SearchError::OptimisticConflict) => continue,
+            }
+        }
+    }
+
+    #[inline]
+    fn get_(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SearchError> {
+        let page = self.search_to_leaf(key, None)?;
+
+        let pre_version = page.version()?;
+        let res = match page.search(key) {
+            // We need to clone the data and then validate the version. This
+            // ensures that the caller isn't looking at invalide data.
+            Ok(v) => Some(v.into()),
+            Err(_) => None,
+        };
+
+        if pre_version != page.version()? {
+            Err(SearchError::OptimisticConflict)
+        } else {
+            Ok(res)
+        }
+    }
+
+    // pub fn scan(&self, range: Range<&[u8]>)
+
+    fn search_to_leaf(&self, key: &[u8], inner_page: Option<Page>) -> Result<Page<'a>, SearchError> {
+        let page = inner_page.as_ref().unwrap_or(&self.root_page);
+        let pre_version = page.version()?;
+
+        // Conversion into the Swip will copy the underlying bytes. Therefore
+        // after this we can validate with confidence that we have a valid
+        // pointer.
+        // What happens if after we do this the referenced page is unswizzled?
+        let swip: Swip = page.get_nearby(key).into();
+
+        let post_version = page.version()?;
+        if pre_version != post_version {
+            return Err(SearchError::OptimisticConflict);
+        }
+
+        match swip {
+            Swip::Swizzle(s) => {
+                // Safety: we know that the root page is an inner page. And
+                // we know data from inner pages are Swips
+                let data = unsafe { self.buffer_manager.load_swizzled(s) };
+                let child = Page::from(data);
+
+                match child.page_type() {
+                    NodeType::Inner => {
+                        return self.search_to_leaf(key, Some(child));
+                    }
+
+                    NodeType::Leaf => {
+                        return Ok(child);
+                    }
+                }
+            }
+
+            Swip::Unswizzle(u) => {
+                todo!("Need to load Unswizzle from disk");
+            }
+        }
+    }
+}
+
+
+use page::PageIterKey;
+
+struct ScanIterator<'a, T: DiskManager> {
+    btree: BTree<'a, T>,
+    cursor: Range<&'a [u8]>,
+    sub_iter: Option<PageIter<'a>>,
+}
+
+impl<'a, T: DiskManager> Iterator for ScanIterator<'a, T> {
+    type Item = (PageIterKey<'a>, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.sub_iter.is_some() {
+            let sub_iter = self.sub_iter.as_mut().unwrap();
+
+            // TODO: Need to pass through key as (prefix, slot, suffix). This
+            // avoids copies.
+
+            let next = sub_iter.next();
+
+            if next.is_some() {
+                return next;
+            } else {
+                self.sub_iter.take();
+            }
+        }
+
+        loop {
+            let page = match self.btree.search_to_leaf(&self.cursor.start, None) {
+                Ok(p) => p,
+                Err(SearchError::OptimisticConflict) => continue,
+            };
+
+            // let pre_version = match page.version() {
+            //     Ok(v) => v,
+            //     Err(_) => continue,
+            // };
+
+            let sub_iter = page.scan(&self.cursor);
+            // page.read_lock();
+            self.sub_iter = Some(sub_iter);
+
+            // let lock = page.read_lock();
+            // self.sub_iter = Some(page.scan(self.cursor));
+            // self.sub_iter_lock = lock;
+
+            todo!("need to implement page.scan")
+        }
+
+        
+
+        // unimplemented!()
+    }
+}
+
+/*
+
+
+for page_iter in btree.scan(b"foo"..b"qux") {
+    let mut results = ...;
+
+    for (k, v) in page_iter {
+        results.push(...)
+    }
+
+    if page_iter.validate() {
+        // good to go! we can store the results
+
+        yeild results / push to outer results, etc
+    } else {
+        // next iteration will contain the same data
+        // We need to forget this iteration's results
+        std::mem::drop(results);
+    }
+
+    // if page_iter panics if validate() wasn't called before drop
+}
+
+
+
+btree
+    .scan(b"foo"..b"qux")
+    .
+
+
+
+*/
+
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchError {
+    OptimisticConflict
+}
+
+impl From<page::VersionLoadError> for SearchError {
+    fn from(e: page::VersionLoadError) -> Self {
+        match e {
+            page::VersionLoadError::Locked => SearchError::OptimisticConflict,
+            page::VersionLoadError::Unloaded => SearchError::OptimisticConflict
+        }
+    }
+}
+
 
 
 struct BTreeOptions {
@@ -186,3 +421,31 @@ Leaf:
 ]
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::FakeDiskManager;
+    use crate::buffer_manager::BufferManager;
+
+    #[test]
+    fn basic_operations() {
+        let disk_manager = FakeDiskManager::default();
+        let max_memory = disk_manager.capacity();
+        let buffer_manager = BufferManager::new(disk_manager, max_memory);
+
+        let page = unsafe { buffer_manager.new_page().unwrap() };
+        let btree = BTree::bootstrap(&buffer_manager, (page.0.into(), page.1)).unwrap();
+
+        btree.insert(b"foo", b"bar");
+        btree.insert(b"qux", b"zap");
+        btree.insert(b"foobar", b"zzz");
+        btree.insert(b"aaa", b"bbb");
+
+        let p0: Page = unsafe { buffer_manager.load_swizzled((0, 0).into()).into() };
+        let p1: Page = unsafe { buffer_manager.load_swizzled((1, 0).into()).into() };
+
+        eprintln!("p0: {:#?}", p0);
+        eprintln!("p1: {:#?}", p1);
+    }
+}

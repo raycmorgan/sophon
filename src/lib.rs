@@ -13,12 +13,17 @@ trait DiskManager {
     fn capacity(&self) -> usize;
     fn base_page_size(&self) -> usize;
 
-    fn allocate_page(&self, size_class: usize) -> Result<Unswizzle, u8>;
+    fn allocate_page(&self, size_class: usize) -> Result<Unswizzle, DiskManagerAllocError>;
     fn deallocate_page();
 
     fn read_page();
     fn write_page();
     fn fsync();
+}
+
+#[derive(Debug, Copy, Clone)]
+enum DiskManagerAllocError {
+    OutOfSpace
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +68,18 @@ impl From<Swizzle> for u64 {
 impl From<(usize, usize)> for Swizzle {
     fn from(parts: (usize, usize)) -> Self {
         Swizzle::new(parts.0, parts.1)
+    }
+}
+
+impl From<Unswizzle> for Swizzle {
+    fn from(u: Unswizzle) -> Self {
+        Swizzle::new(u.page_id(), u.size_class())
+    }
+}
+
+impl From<Swizzle> for Unswizzle {
+    fn from(s: Swizzle) -> Self {
+        Unswizzle::from_parts(s.page_id(), s.size_class())
     }
 }
 
@@ -119,10 +136,39 @@ impl From<u64> for Swip {
     }
 }
 
+impl From<&[u8]> for Swip {
+    fn from(input: &[u8]) -> Self {
+        let data = u64::from_le_bytes(input[0..8].try_into().unwrap());
+        data.into()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
-    use crate::Unswizzle;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    
+    #[derive(Default)]
+    pub struct FakeDiskManager {
+        next_page: AtomicUsize,
+    }
+
+    impl DiskManager for FakeDiskManager {
+        fn capacity(&self) -> usize { 4096 * 1000 }
+        fn base_page_size(&self) -> usize { 4096 }
+
+        fn allocate_page(&self, size_class: usize) -> Result<Unswizzle, DiskManagerAllocError> {
+            let next = self.next_page.fetch_add(1, Ordering::SeqCst);
+            Ok(Unswizzle::from_parts(next, size_class))
+        }
+
+        fn deallocate_page() {}
+
+        fn read_page() {}
+        fn write_page() {}
+        fn fsync() {}
+    }
 
     #[test]
     fn it_works() {

@@ -1,17 +1,19 @@
-use crate::{DiskManager, Swizzle, Unswizzle};
+use crate::{DiskManager, DiskManagerAllocError, Swizzle, Unswizzle};
 use std::fmt;
 use std::cell::UnsafeCell;
 use madvise::AdviseMemory;
 use memmap::MmapMut;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-struct BufferManager<'a, D: DiskManager> {
+pub(crate) struct BufferManager<D: DiskManager> {
     disk_manager: D,
     base_page_size: usize,
     max_memory: usize,
-    page_classes: Vec<PageClass<'a>>,
+    page_classes: Vec<PageClass>,
+    version_boundary: AtomicU64,
 }
 
-impl<'a, D: DiskManager> fmt::Debug for BufferManager<'a, D> {
+impl<D: DiskManager> fmt::Debug for BufferManager<D> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("PageClass")
            .field("base_page_size", &self.base_page_size)
@@ -21,7 +23,7 @@ impl<'a, D: DiskManager> fmt::Debug for BufferManager<'a, D> {
     }
 }
 
-impl<'a, D: DiskManager> BufferManager<'a, D> {
+impl<D: DiskManager> BufferManager<D> {
     pub fn new(disk_manager: D,max_memory: usize) -> Self {
         let base_page_size = disk_manager.base_page_size();
         let mut page_classes = Vec::new();
@@ -37,15 +39,16 @@ impl<'a, D: DiskManager> BufferManager<'a, D> {
             base_page_size,
             max_memory,
             page_classes,
+            version_boundary: AtomicU64::new(0),
         }
     }
 
     /// Safety: Caller is responsible for managing concurrency on the returned
     /// buffer. The BufferManager does not prevent aliasing. Even though this
     /// is logically a new page, it might be a recycled freed page.
-    pub unsafe fn new_page(&self) -> Result<&'a mut [u8], u8> {
+    pub unsafe fn new_page(&self) -> Result<(Swizzle, &mut [u8]), DiskManagerAllocError> {
         let unswizzle = self.disk_manager.allocate_page(0)?;
-        Ok(self.page_classes[0].get_page(unswizzle.page_id()))
+        Ok((unswizzle.into(), self.page_classes[0].get_page(unswizzle.page_id())))
     }
 
     pub fn free_page() {}
@@ -55,29 +58,35 @@ impl<'a, D: DiskManager> BufferManager<'a, D> {
     /// pointer and convert that into a Page. Caller needs to be certain that
     /// the referenced pointer is in fact pointing to one of the mmap'ed
     /// segements created by PageClass.
-    pub unsafe fn load_swizzled(&self, swizzle: Swizzle) -> &'a mut [u8] {
+    pub unsafe fn load_swizzled(&self, swizzle: Swizzle) -> &mut [u8] {
         let page_class = &self.page_classes[swizzle.size_class()];
         page_class.get_page(swizzle.page_id())
     }
 
-    pub async fn load_unswizzled(&self, unswizzle: usize) -> &'a mut [u8] {
+    pub async fn load_unswizzled(&self, unswizzle: usize) -> &mut [u8] {
         // TODO: This function will look at the cooling stage and either reheat
         // or perform a fetch from the cold store (disk). The latter is why this
         // function is async -- if it needs to go to disk, that will require an
         // async operation.
         unimplemented!()
     }
+
+    pub(crate) fn version_boundary(&self) -> u64 {
+        self.version_boundary.load(Ordering::Acquire)
+    }
+
+    // TODO: Ensure when unswizzling a page, we bump version_boundary
 }
 
-struct PageClass<'a> {
+struct PageClass {
     page_size: usize,
     capacity: usize,
     mmap: UnsafeCell<MmapMut>,
 
-    marker: std::marker::PhantomData<&'a ()>,
+    // marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> fmt::Debug for PageClass<'a> {
+impl fmt::Debug for PageClass {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("PageClass")
            .field("page_size", &self.page_size)
@@ -87,7 +96,7 @@ impl<'a> fmt::Debug for PageClass<'a> {
     }
 }
 
-impl<'a> PageClass<'a> {
+impl PageClass {
     fn new(page_size: usize, capacity: usize) -> Self {
         assert!(capacity % 4096 == 0, "capacity must be divisible by 4096");
         let mmap = UnsafeCell::new(MmapMut::map_anon(capacity).unwrap());
@@ -96,7 +105,7 @@ impl<'a> PageClass<'a> {
             page_size,
             capacity,
             mmap,
-            marker: Default::default()
+            // marker: Default::default()
         }
     }
 
@@ -107,7 +116,7 @@ impl<'a> PageClass<'a> {
     /// Safety: This function will happily hand out multiple instances of the
     /// same underlying range. It is the responsibility of the caller to manage
     /// any potential data races.
-    unsafe fn get_page(&self, page_id: usize) -> &'a mut [u8] {
+    unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
 
         let mmap = self.mmap.get().as_mut().unwrap();
@@ -156,34 +165,12 @@ impl<'a> PageClass<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DiskManager, Unswizzle};
-
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct FakeDiskManager {
-        next_page: AtomicUsize,
-    }
-
-    impl DiskManager for FakeDiskManager {
-        fn capacity(&self) -> usize { 4096 * 1000 }
-        fn base_page_size(&self) -> usize { 4096 }
-
-        fn allocate_page(&self, size_class: usize) -> Result<Unswizzle, u8> {
-            let next = self.next_page.fetch_add(1, Ordering::SeqCst);
-            Ok(Unswizzle::from_parts(next, size_class))
-        }
-
-        fn deallocate_page() {}
-
-        fn read_page() {}
-        fn write_page() {}
-        fn fsync() {}
-    }
+    use crate::tests::FakeDiskManager;
 
     #[test]
     fn it_works() {
-        let dm = FakeDiskManager{ next_page: AtomicUsize::new(0) };
-        let bm = BufferManager::new(dm, 4096 * 4096);
+        let dm = FakeDiskManager::default();
+        let _bm = BufferManager::new(dm, 4096 * 4096);
         // eprintln!("{:?}", bm);
     }
 }
