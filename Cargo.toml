@@ -10,3 +10,7 @@ memmap = "0.7.0"
 madvise = "0.1.0"
 byte-unit = "4.0"
 parking_lot = "0.11"
+stackvec = "0.2.1"
+log = "0.4"
+env_logger = "0.9"
+rand = { version = "0.8", features = ["min_const_gen"] }

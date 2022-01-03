@@ -1,19 +1,24 @@
-use crate::{DiskManager, DiskManagerAllocError, Swizzle, Unswizzle};
+use crate::{DiskManager, DiskManagerAllocError, buffer_manager::swip::Swip};
 use std::fmt;
 use std::cell::UnsafeCell;
 use madvise::AdviseMemory;
 use memmap::MmapMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) struct BufferManager<D: DiskManager> {
-    disk_manager: D,
+use self::buffer_frame::BufferFrame;
+
+pub(crate) mod swip;
+pub(crate) mod buffer_frame;
+
+pub(crate) struct BufferManager {
+    disk_manager: Box<dyn DiskManager>,
     base_page_size: usize,
     max_memory: usize,
     page_classes: Vec<PageClass>,
     version_boundary: AtomicU64,
 }
 
-impl<D: DiskManager> fmt::Debug for BufferManager<D> {
+impl fmt::Debug for BufferManager {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("PageClass")
            .field("base_page_size", &self.base_page_size)
@@ -23,8 +28,8 @@ impl<D: DiskManager> fmt::Debug for BufferManager<D> {
     }
 }
 
-impl<D: DiskManager> BufferManager<D> {
-    pub fn new(disk_manager: D,max_memory: usize) -> Self {
+impl BufferManager {
+    pub fn new(disk_manager: Box<dyn DiskManager>, max_memory: usize) -> Self {
         let base_page_size = disk_manager.base_page_size();
         let mut page_classes = Vec::new();
 
@@ -43,12 +48,22 @@ impl<D: DiskManager> BufferManager<D> {
         }
     }
 
-    /// Safety: Caller is responsible for managing concurrency on the returned
-    /// buffer. The BufferManager does not prevent aliasing. Even though this
-    /// is logically a new page, it might be a recycled freed page.
-    pub unsafe fn new_page(&self) -> Result<(Swizzle, &mut [u8]), DiskManagerAllocError> {
-        let unswizzle = self.disk_manager.allocate_page(0)?;
-        Ok((unswizzle.into(), self.page_classes[0].get_page(unswizzle.page_id())))
+    pub fn new_page<T>(&self) -> Result<Swip<T>, DiskManagerAllocError> {
+        let page_id = self.disk_manager.allocate_page(0)?;
+        let page: &mut buffer_frame::Page = unsafe {
+            std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr())
+        };
+
+        let bf = Box::new(BufferFrame::new(page));
+        let swip = Swip::new(bf.as_ref() as *const _ as usize);
+
+        // manually managed memory
+        // TODO: move this to preallocated frames instead of alloc on new_page
+        std::mem::forget(bf);
+
+        Ok(swip)
+
+        // Ok((unswizzle.into(), self.page_classes[0].get_page(unswizzle.page_id())))
     }
 
     pub fn free_page() {}
@@ -58,10 +73,11 @@ impl<D: DiskManager> BufferManager<D> {
     /// pointer and convert that into a Page. Caller needs to be certain that
     /// the referenced pointer is in fact pointing to one of the mmap'ed
     /// segements created by PageClass.
-    pub unsafe fn load_swizzled(&self, swizzle: Swizzle) -> &mut [u8] {
-        let page_class = &self.page_classes[swizzle.size_class()];
-        page_class.get_page(swizzle.page_id())
-    }
+    // pub unsafe fn load_swizzled(&self, swizzle: Swizzle) -> &mut [u8] {
+    //     unimplemented!();
+    //     let page_class = &self.page_classes[swizzle.size_class()];
+    //     page_class.get_page(swizzle.page_id())
+    // }
 
     pub async fn load_unswizzled(&self, unswizzle: usize) -> &mut [u8] {
         // TODO: This function will look at the cooling stage and either reheat
@@ -118,6 +134,7 @@ impl PageClass {
     /// any potential data races.
     unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
+        println!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
 
         let mmap = self.mmap.get().as_mut().unwrap();
         &mut mmap[start..start+self.page_size]
@@ -169,7 +186,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let dm = FakeDiskManager::default();
+        let dm = Box::new(FakeDiskManager::default());
         let _bm = BufferManager::new(dm, 4096 * 4096);
         // eprintln!("{:?}", bm);
     }

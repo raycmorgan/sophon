@@ -8,7 +8,6 @@ use crate::{DiskManager, DiskManagerAllocError, Unswizzle, Swip, buffer_manager}
 // use crate::buffer_manager::Page;
 
 mod page;
-mod node;
 
 // const NODE_TYPE_INNER: u64 = 1;
 // const NODE_TYPE_LEAF: u64 = 1 << 1;
@@ -41,13 +40,13 @@ use page::Page;
 
 use self::page::PageIter;
 
-struct BTree<'a, D: DiskManager> {
-    buffer_manager: &'a BufferManager<D>,
+struct BTree<'a> {
+    buffer_manager: &'a BufferManager,
     root_page: Page<'a>,
 }
 
-impl<'a, D: DiskManager> BTree<'a, D> {
-    pub fn from(buffer_manager: &'a BufferManager<D>, root_page: &'a mut [u8]) -> Self {
+impl<'a> BTree<'a> {
+    pub fn from(buffer_manager: &'a BufferManager, root_page: &'a mut [u8]) -> Self {
         let mut root_page = Page::from(root_page);
 
         let initial_version = buffer_manager.version_boundary();
@@ -59,7 +58,7 @@ impl<'a, D: DiskManager> BTree<'a, D> {
         }
     }
 
-    pub fn bootstrap(buffer_manager: &'a BufferManager<D>, data: (Unswizzle, &'a mut [u8])) -> Result<Self, DiskManagerAllocError> {
+    pub fn bootstrap(buffer_manager: &'a BufferManager, data: (Unswizzle, &'a mut [u8])) -> Result<Self, DiskManagerAllocError> {
         let mut root_page = Page::from(data.1);
         let initial_version = buffer_manager.version_boundary();
 
@@ -168,14 +167,14 @@ impl<'a, D: DiskManager> BTree<'a, D> {
 
 use page::PageIterKey;
 
-struct ScanIterator<'a, T: DiskManager> {
-    btree: &'a BTree<'a, T>,
+struct ScanIterator<'a> {
+    btree: &'a BTree<'a>,
     range: Range<&'a [u8]>,
     leaf: Option<Page<'a>>,
 }
 
-impl<'a, T: DiskManager> ScanIterator<'a, T> {
-    fn new(btree: &'a BTree<'a, T>, range: Range<&'a [u8]>) -> Self {
+impl<'a> ScanIterator<'a> {
+    fn new(btree: &'a BTree<'a>, range: Range<&'a [u8]>) -> Self {
         ScanIterator {
             btree,
             range,
@@ -184,7 +183,7 @@ impl<'a, T: DiskManager> ScanIterator<'a, T> {
     }
 }
 
-impl<'a, T: DiskManager> Iterator for ScanIterator<'a, T> {
+impl<'a> Iterator for ScanIterator<'a> {
     type Item = (PageIterKey<'a>, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -461,7 +460,7 @@ mod tests {
 
     #[test]
     fn basic_operations() {
-        let disk_manager = FakeDiskManager::default();
+        let disk_manager = Box::new(FakeDiskManager::default());
         let max_memory = disk_manager.capacity();
         let buffer_manager = BufferManager::new(disk_manager, max_memory);
 
