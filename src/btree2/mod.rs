@@ -1,5 +1,6 @@
 use std::{mem::size_of, fmt::Debug};
 
+use log::debug;
 use stackvec::StackVec;
 
 use crate::buffer_manager::{BufferManager, swip::Swip, buffer_frame::{ExclusiveGuard, OptimisticError, PageGuard, SharedGuard2, LatchStrategy}};
@@ -81,10 +82,10 @@ impl<'a> BTree<'a> {
                 node.root_split(&mut left, &mut right, &pivot_key);
 
                 if key < &pivot_key {
-                    println!("Inserting Left: k:{:?} v:({})", key, value.len());
+                    debug!("Inserting Left: k:{:?} v:({})", key, value.len());
                     left.insert(key, value).expect("Space to now exist");
                 } else {
-                    println!("Inserting Right: k:{:?} v:({})", key, value.len());
+                    debug!("Inserting Right: k:{:?} v:({})", key, value.len());
                     right.insert(key, value).expect("Space to now exist");
                 }
 
@@ -105,7 +106,7 @@ impl<'a> BTree<'a> {
                 parent.upgrade_exclusive();
 
                 if version != parent.version() {
-                    println!("Version mismatch, restart.");
+                    debug!("Version mismatch, restart.");
                     continue 'outer;
                 }
 
@@ -178,7 +179,7 @@ impl<'a> BTree<'a> {
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                 let mut right = right_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
 
-                println!("[btree] parent.insert: {:?}=>{}", pivot_key, &right_swip.value());
+                debug!("[btree] parent.insert: {:?}=>{}", pivot_key, &right_swip.value());
 
                 parent.insert(&pk, &right_swip.value().to_ne_bytes()).expect("space should exist");
                 parent.downgrade();
@@ -207,7 +208,7 @@ impl<'a> BTree<'a> {
     /// Returned PageGuard are returned locked via `strategy`
     /// Returned PageGuards in LockPath are Optimistic
     fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> Result<(PageGuard<Node>, LockPath), SearchError> {
-        println!("search_to_leaf: {:?}", key);
+        debug!("search_to_leaf: {:?}", key);
 
         'restart: loop {
             let mut path: LockPath = Default::default();
@@ -220,7 +221,7 @@ impl<'a> BTree<'a> {
                     Err(OptimisticError::Conflict) => continue 'restart,
                 };
 
-                println!("pid: {}, is_leaf: {}", node.pid(), node.is_leaf());
+                debug!("pid: {}, is_leaf: {}", node.pid(), node.is_leaf());
 
                 if node.is_leaf() {
                     // TODO: If we tracked height, we could perform this Shared latch without the spin above

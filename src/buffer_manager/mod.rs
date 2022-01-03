@@ -1,6 +1,7 @@
 use crate::{DiskManager, DiskManagerAllocError, buffer_manager::swip::Swip};
 use std::fmt;
 use std::cell::UnsafeCell;
+use log::debug;
 use madvise::AdviseMemory;
 use memmap::MmapMut;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -134,7 +135,7 @@ impl PageClass {
     /// any potential data races.
     unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
-        println!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
+        debug!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
 
         let mmap = self.mmap.get().as_mut().unwrap();
         &mut mmap[start..start+self.page_size]

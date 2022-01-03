@@ -133,7 +133,7 @@ impl Node {
         self.header.lower_fence = lowerf;
         self.header.upper_fence = upperf;
 
-        println!("[init_header] lower fence: {:?}, upper fence: {:?}, prefix: {:?}",
+        debug!("[init_header] lower fence: {:?}, upper fence: {:?}, prefix: {:?}",
         lower_fence, upper_fence, prefix);
     }
 
@@ -440,8 +440,8 @@ impl Node {
         let mut temp = [0u8; MAX_KEY_LEN];
         let split_key = self.copy_key(pivot_slot, &mut temp);
 
-        println!("[split] Splitting non-root: {} at {:?}:{} | pivot_key: {:?}", self.header.pid, split_key, pivot, pivot_key);
-        println!("[split] Lower fence: {:?}, Upper fence: {:?}", self.lower_fence(), self.upper_fence());
+        debug!("[split] Splitting non-root: {} at {:?}:{} | pivot_key: {:?}", self.header.pid, split_key, pivot, pivot_key);
+        debug!("[split] Lower fence: {:?}, Upper fence: {:?}", self.lower_fence(), self.upper_fence());
 
         let pid = right.pid();
         right.init_header(
@@ -454,7 +454,7 @@ impl Node {
             self.upper_fence(),
         );
 
-        println!("[split] Created Right Peer {}, is_leaf: {}", pid, right.is_leaf());
+        debug!("[split] Created Right Peer {}, is_leaf: {}", pid, right.is_leaf());
 
         let mut i = pivot + 1;
 
@@ -468,7 +468,7 @@ impl Node {
             let key = self.copy_key(*slot, &mut temp);
             let value = self.get_data_value(*slot);
 
-            println!("[split] Insert right: {:?}=>({})", key, value.len());
+            debug!("[split] Insert right: {:?}=>({})", key, value.len());
             right.insert(key, value).expect("infallible");
 
             i += 1;
@@ -477,7 +477,7 @@ impl Node {
         self.header.slot_count = (pivot + 1) as u16;
         self.compact(&mut temp, Some(&right.lower_fence()));
 
-        println!("Post compact: prefix=>{:?}", self.prefix());
+        debug!("Post compact: prefix=>{:?}", self.prefix());
 
         #[cfg(debug_assertions)] {
             debug_assert_eq!(slot_count, self.header.slot_count + right.header.slot_count);
@@ -545,7 +545,7 @@ impl Node {
         // update self.slot_count to remove tail slots >= pivot
         // compact self
 
-        println!("Splitting root. Slot Count: {}, Pivot: {:?}", self.slots().len(), pivot_key);
+        debug!("Splitting root. Slot Count: {}, Pivot: {:?}", self.slots().len(), pivot_key);
 
         let mut temp = [0u8; MAX_KEY_LEN];
 
@@ -597,16 +597,16 @@ impl Node {
             let value = self.get_data_value(*slot);
 
             if i <= pivot {
-                println!("Insert left: {:?}, v({})", key, value.len());
+                debug!("Insert left: {:?}, v({})", key, value.len());
                 left.insert(key, value).expect("infallible");
             } else {
-                println!("Insert right: {:?}, v({})", key, value.len());
+                debug!("Insert right: {:?}, v({})", key, value.len());
                 right.insert(key, value).expect("infallible");
             }
         }
 
-        println!("Left pid {}, is_leaf: {}", l_pid, left.is_leaf());
-        println!("Right pid {}, is_leaf: {}", r_pid, right.is_leaf());
+        debug!("Left pid {}, is_leaf: {}", l_pid, left.is_leaf());
+        debug!("Right pid {}, is_leaf: {}", r_pid, right.is_leaf());
 
         // TODO: clear out self!
         self.header.slot_count = 0;
@@ -624,7 +624,7 @@ impl Node {
         self.insert(right.lower_fence(), &right.swip_bytes()).expect("infallible");
 
         // println!("Parent, header.upper_swip: {:?}", self.header.upper_swip);
-        println!("Parent, insert: {:?}", pivot_key);
+        debug!("Parent, insert: {:?}", pivot_key);
 
         #[cfg(debug_assertions)] {
             for (name, n) in &[
@@ -675,18 +675,25 @@ impl Node {
         // to be incorrect (outside of the bounds)
     
         #[cfg(debug_assertions)] {
-            print!("Slots: <");
+            let mut str = String::with_capacity(DATA_CAPACITY);
+
+            str.push_str("Slots: <");
+
             for slot in self.slots() {
                 if self.is_leaf() {
-                    print!("{:?}=>{}, ", slot.key, slot.data_len);
+                    // str.push_str(slot.key);
+                    // str.push_str("=>{}, ");
+                    // str.push_str(&format!("{:?}=>{}, ", slot.key, slot.data_len));
                 } else {
-                    print!("{:?}=>{:?}, ", slot.key, u64::from_ne_bytes(self.get_data_value(*slot).try_into().unwrap()));
+                    // str.push_str(&format!("{:?}=>{:?}, ", 
+                    //     slot.key, 
+                    //     u64::from_ne_bytes(self.get_data_value(*slot).try_into().unwrap())
+                    // ));
                 }
-
-                
             }
+            str.push_str(" >");
             // print!("{:?}", self.header.upper_swip.map(|s| u64::from_ne_bytes(s)));
-            println!(" >");
+            debug!("{}", str);
         }
 
         self.slots().binary_search_by(|s| {
