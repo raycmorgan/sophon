@@ -125,6 +125,7 @@ impl<T> Swip<T> {
             LatchStrategy::OptimisticOrExclusive => PageGuard::new_optimistic_or_exclusive(self),
             LatchStrategy::Exclusive => PageGuard::new_exclusive(self),
             LatchStrategy::Shared => PageGuard::new_shared(self),
+            LatchStrategy::Yolo => PageGuard::new_yolo(self),
             LatchStrategy::OptimisticOrConflict => unimplemented!(),
         };
 

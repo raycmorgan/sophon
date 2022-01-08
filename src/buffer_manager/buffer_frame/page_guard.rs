@@ -19,19 +19,13 @@ pub(crate) enum LatchStrategy {
     OptimisticOrExclusive,
     Shared,
     Exclusive,
+    Yolo,
 }
 
 pub(crate) struct PageGuard<T> {
     swip: Swip<T>,
     initial_version: u64,
     state: LockState,
-}
-
-impl<T> Debug for PageGuard<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LockGuard")
-            .finish()
-    }
 }
 
 impl<T> PageGuard<T> {
@@ -84,6 +78,17 @@ impl<T> PageGuard<T> {
             state = LockState::Exclusive;
         }
 
+        PageGuard {
+            swip,
+            initial_version,
+            state,
+        }
+    }
+
+    pub(crate) fn new_yolo(swip: Swip<T>) -> Self {
+        let frame = unsafe { swip.as_buffer_frame() };
+        let state = LockState::Optimistic;
+        let initial_version = frame.version();
         PageGuard {
             swip,
             initial_version,
@@ -159,6 +164,11 @@ impl<T> PageGuard<T> {
     #[inline]
     pub(crate) fn swip_bytes(&self) -> [u8; 8] {
         self.swip.value_bytes()
+    }
+
+    #[inline]
+    pub(crate) fn swip_value(&self) -> u64 {
+        self.swip.value()
     }
 
     #[inline]

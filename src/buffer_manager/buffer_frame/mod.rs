@@ -72,6 +72,7 @@ impl<'a> BufferFrame<'a> {
 
     unsafe fn upgrade_latch(&self) {
         self.header.latch.upgrade();
+        self.header.version.fetch_or(1u64 << 63, Ordering::AcqRel);
     }
 
     fn version(&self) -> u64 {

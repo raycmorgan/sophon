@@ -1,10 +1,10 @@
-use std::{mem::{size_of, ManuallyDrop}, sync::atomic::AtomicU64, ops::{Range, Index}, fmt::Debug};
+use std::{mem::{size_of, ManuallyDrop}, sync::atomic::AtomicU64, ops::{Range, Index, Deref}, fmt::Debug};
 use log::debug;
 use parking_lot::RawRwLock;
 use stackvec::{StackVec, TryCollect};
 
 use crate::buffer_manager::{
-    buffer_frame::{USABLE_PAGE_SIZE, ExclusiveGuard, PageGuard},
+    buffer_frame::{USABLE_PAGE_SIZE, ExclusiveGuard, PageGuard, LatchStrategy},
     swip::Swip
 };
 
@@ -145,17 +145,31 @@ impl Node {
         }
     }
 
+    #[inline]
+    pub(crate) fn insert_inner(&mut self, child: &PageGuard<Node>) -> Result<(), InsertError> {
+        debug_assert!(self.contains(child));
+        self.insert(child.lower_fence(), &child.swip_bytes())
+    }
+
     pub(crate) fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
         assert!(key.len() < MAX_KEY_LEN); // return error
         debug_assert!(value.len() < 1024 * 15);
-        debug_assert!(&key[..self.header.prefix_len as usize] == self.prefix());
+        debug_assert!(key >= self.lower_fence(), "Key outside of lower fence bound.\nKey: {:?}\nNode: {:?}", key, self);
+        debug_assert!(self.upper_fence() == &[] || key < self.upper_fence(), "Key outside of upper fence bound.\nKey: {:?}\nNode: {:?}", key, self);
+        debug_assert!(
+            &key[..self.header.prefix_len as usize] == self.prefix(),
+            "Prefix mismatch:\nKey Prefix: {:?}\nNode: {:?}", &key[..self.header.prefix_len as usize], self
+        );
 
         let key = &key[self.header.prefix_len as usize..];
         let key_len = key.len();
         let key_parts = key_parts(&key);
         let data_len = key_parts.1.len() + value.len();
 
-        if data_len + key_parts.1.len() + size_of::<Slot>() > self.available_space() {
+        if data_len + size_of::<Slot>() > self.available_space() {
+            // println!("data_len: {}, key_parts.1.len(): {}, _of::<Slot>(): {}, self.available_space(): {}, active_space: {}",
+            // data_len, key_parts.1.len(), size_of::<Slot>(), self.available_space(), self.header.space_active);
+
             // TODO: Check to see if we can compact to prevent a split
             return Err(InsertError::InsufficientSpace);
         }
@@ -173,7 +187,10 @@ impl Node {
         self.header.space_active += data_len as u16;
 
         let pos = match self.search(&key_parts) {
-            Ok(pos) => pos,
+            Ok(pos) => {
+                // todo: recapture prior active space as this is an update
+                pos
+            },
             Err(pos) => {
                 let slot_count = self.header.slot_count as usize;
                 
@@ -234,6 +251,13 @@ impl Node {
 
         // let idx = self.search(&key_parts).unwrap_or_else(|i| i);
 
+        // [a, d, e, m]
+        // a => 0
+        // b => 0
+        // d => 1
+        // e => 2
+        // m => 3
+
         let pos = match self.search(&key_parts) {
             Ok(pos) => {
                 pos
@@ -243,9 +267,13 @@ impl Node {
             }
 
             Err(pos) => {
-                pos
+                if pos == 0 {
+                    panic!("Key: {:?}\nSlot[0]: {:?}\nNode: {:?}", key, self.slots()[0], self);
+                }
+
+                pos - 1
             }
-        } - 1;
+        };
 
         let slot = self.slots()[pos];
         Some(self.get_data_value(slot))
@@ -279,6 +307,18 @@ impl Node {
     }
 
     #[inline]
+    /// Returns (pivot, key_len, value_len)
+    pub(crate) fn pivot_for_split(&self) -> (usize, usize, usize) {
+        let pivot = (self.header.slot_count as usize) / 2;
+        let pivot_slot = self.slots()[pivot];
+
+        let key_len = (self.header.prefix_len + pivot_slot.key_len) as usize;
+        let value_len = pivot_slot.data_len as usize;
+
+        (pivot, key_len, value_len)
+    }
+
+    #[inline]
     pub(crate) fn pivot_key_for_split<'b>(&self, key: &[u8], _value_len: usize, dst: &'b mut [u8]) -> &'b [u8] {
         // TODO: Optimize split based on contents and position of data.
         // For example, if the key is greater than all items in the node,
@@ -293,10 +333,10 @@ impl Node {
         // Special case: there is only 1 element and the new key is less than the
         // existing key. We want to make sure the new key is inserted into the
         // left node and the existing item moves to the right node.
-        if pivot == 0 && key < pivot_key {
-            dst[0..key.len()].copy_from_slice(key);
-            return &dst[0..key.len()];
-        }
+        // if pivot == 0 && key < pivot_key {
+        //     dst[0..key.len()].copy_from_slice(key);
+        //     return &dst[0..key.len()];
+        // }
 
         return self.copy_key(pivot_slot, dst);
 
@@ -420,7 +460,7 @@ impl Node {
     }
 
     #[inline]
-    pub(crate) fn split(&mut self, right: &mut PageGuard<Node>, pivot_key: &[u8]) {
+    pub(crate) fn split(&mut self, right: &mut PageGuard<Node>, pivot: usize) {
         // let key = &pivot_key[self.header.prefix_len as usize..];
         // let key_parts = key_parts(&key);
         // let pivot = self.search(&key_parts).unwrap_or_else(|i| i);
@@ -432,15 +472,15 @@ impl Node {
         #[cfg(debug_assertions)]
         let slot_count = self.header.slot_count;
 
-        let pivot = self.search(&key_parts(&pivot_key))
-            .map(|i| i)
-            .unwrap_or_else(|e| e);
+        // let pivot = self.search(&key_parts(&pivot_key))
+        //     .map(|i| i)
+        //     .unwrap_or_else(|e| e);
         let pivot_slot = self.slots()[pivot];
 
         let mut temp = [0u8; MAX_KEY_LEN];
         let split_key = self.copy_key(pivot_slot, &mut temp);
 
-        debug!("[split] Splitting non-root: {} at {:?}:{} | pivot_key: {:?}", self.header.pid, split_key, pivot, pivot_key);
+        // debug!("[split] Splitting non-root: {} at {:?}:{} | pivot_key: {:?}", self.header.pid, split_key, pivot, pivot_key);
         debug!("[split] Lower fence: {:?}, Upper fence: {:?}", self.lower_fence(), self.upper_fence());
 
         let pid = right.pid();
@@ -456,25 +496,27 @@ impl Node {
 
         debug!("[split] Created Right Peer {}, is_leaf: {}", pid, right.is_leaf());
 
-        let mut i = pivot + 1;
+        let mut i = pivot;
 
         // if !self.is_leaf() {
         //     // let value = self.get_data_value(pivot_slot);
         //     // self.header.upper_swip = Some(value.try_into().expect("len match"));
         // }
+        //       v
+        // [c, e, g, m, z]
+        //       |->
+
 
         let slots = self.slots();
         while let Some(slot) = slots.get(i) {
             let key = self.copy_key(*slot, &mut temp);
             let value = self.get_data_value(*slot);
-
-            debug!("[split] Insert right: {:?}=>({})", key, value.len());
             right.insert(key, value).expect("infallible");
 
             i += 1;
         }
         
-        self.header.slot_count = (pivot + 1) as u16;
+        self.header.slot_count = pivot as u16;
         self.compact(&mut temp, Some(&right.lower_fence()));
 
         debug!("Post compact: prefix=>{:?}", self.prefix());
@@ -485,7 +527,12 @@ impl Node {
 
             let slots = self.slots();
             let min_key = self.copy_key(slots[0], &mut temp);
-            debug_assert!(self.lower_fence() <= min_key, "{:?} <= {:?}", self.lower_fence(), min_key);
+            if !self.is_leaf() {
+                debug_assert!(self.lower_fence() == min_key, "{:?} == {:?}", self.lower_fence(), min_key);
+            } else {
+                debug_assert!(self.lower_fence() <= min_key, "{:?} <= {:?}", self.lower_fence(), min_key);
+            }
+            
             let max_key = self.copy_key(*slots.last().expect("infallible"), &mut temp);
             if self.upper_fence() != b"" { // special case upper_fence
                 debug_assert!(self.upper_fence() >= max_key, "{:?} < {:?}", self.upper_fence(), max_key);
@@ -523,9 +570,12 @@ impl Node {
 
         for slot in self.slots() {
             let key = self.copy_key(*slot, tmp_buffer);
+            debug_assert!(key < tmp.upper_fence(), "{:?}", tmp);
             let value = self.get_data_value(*slot);
             tmp.insert(key, value).expect("infallible");
         }
+
+        debug_assert!(tmp.header.slot_count == self.header.slot_count);
 
         self.data_mut().copy_from_slice(tmp.data());
         self.header.lower_fence = tmp.header.lower_fence;
@@ -536,7 +586,19 @@ impl Node {
     }
 
     #[inline]
-    pub(crate) fn root_split(&mut self, left: &mut PageGuard<Node>, right: &mut PageGuard<Node>, pivot_key: &[u8]) {
+    pub(crate) fn shares_prefix(&self, key: &[u8]) -> bool {
+        let prefix_len = self.header.prefix_len as usize;
+        &key[0..prefix_len.min(key.len())] == self.prefix()
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, other: &PageGuard<Node>) -> bool {
+        other.lower_fence() >= self.lower_fence() &&
+            (self.upper_fence() == &[] || other.upper_fence() <= self.upper_fence())
+    }
+
+    #[inline]
+    pub(crate) fn root_split(&mut self, left: &mut PageGuard<Node>, right: &mut PageGuard<Node>, pivot: usize) {
         // let key = &pivot_key[self.header.prefix_len as usize..];
         // let key_parts = key_parts(&key);
         // let pivot = self.search(&key_parts).unwrap_or_else(|i| i);
@@ -545,19 +607,15 @@ impl Node {
         // update self.slot_count to remove tail slots >= pivot
         // compact self
 
-        debug!("Splitting root. Slot Count: {}, Pivot: {:?}", self.slots().len(), pivot_key);
+        // debug!("Splitting root. Slot Count: {}, Pivot: {:?}", self.slots().len(), pivot_key);
 
         let mut temp = [0u8; MAX_KEY_LEN];
 
         let l_pid = left.pid();
         let r_pid = right.pid();
 
-        let pivot = self
-            .search(&key_parts(&pivot_key))
-            .unwrap_or_else(|e| e);
         let pivot_slot = self.slots()[pivot];
         let split_key = self.copy_key(pivot_slot, &mut temp);
-
 
         // [a, b, d, e, t].z;
         // [a, b, d] [e, t, z]
@@ -583,8 +641,6 @@ impl Node {
             self.upper_fence(),
         );
 
-        
-
         for (i, slot) in self.slots().iter().enumerate() {
             // Special case: if left/right are inner nodes, we will need to
             // set the value to the upper_swip
@@ -596,7 +652,7 @@ impl Node {
             let key = self.copy_key(*slot, &mut temp);
             let value = self.get_data_value(*slot);
 
-            if i <= pivot {
+            if i < pivot {
                 debug!("Insert left: {:?}, v({})", key, value.len());
                 left.insert(key, value).expect("infallible");
             } else {
@@ -619,12 +675,17 @@ impl Node {
         data.fill(0);
 
         // insert left and right
-        // self.header.upper_swip = Some(right.swip_bytes());
-        self.insert(left.lower_fence(), &left.swip_bytes()).expect("infallible");
-        self.insert(right.lower_fence(), &right.swip_bytes()).expect("infallible");
+        debug_assert!(left.lower_fence() < right.lower_fence());
+        // self.insert(left.lower_fence(), &left.swip_bytes()).expect("infallible");
+        // self.insert(right.lower_fence(), &right.swip_bytes()).expect("infallible");
+
+        self.insert_inner(left).expect("infallible");
+        self.insert_inner(right).expect("infallible");
 
         // println!("Parent, header.upper_swip: {:?}", self.header.upper_swip);
-        debug!("Parent, insert: {:?}", pivot_key);
+        // debug!("Parent, insert: {:?}", pivot_key);
+
+        debug_assert_eq!(left.upper_fence(), right.lower_fence());
 
         #[cfg(debug_assertions)] {
             for (name, n) in &[
@@ -637,10 +698,14 @@ impl Node {
                 if slots.len() == 0 {
                     continue;
                 }
-
                 
                 let min_key = n.copy_key(slots[0], &mut temp);
-                debug_assert!(n.lower_fence() <= min_key, "{}: {:?} <= {:?}", name, n.lower_fence(), min_key);
+
+                if n.is_leaf() {
+                    debug_assert!(n.lower_fence() <= min_key, "{}: {:?} <= {:?}", name, n.lower_fence(), min_key);
+                } else {
+                    debug_assert!(n.lower_fence() == min_key, "{}: {:?} == {:?}", name, n.lower_fence(), min_key);
+                }
                 
                 let max_key = n.copy_key(*slots.last().expect("infallible"), &mut temp);
 
@@ -747,9 +812,9 @@ impl Node {
 
     #[inline]
     fn available_space(&self) -> usize {
-        size_of::<NodeContents>()
-         - self.header.slot_count as usize * size_of::<Slot>()
-         - self.header.space_used as usize
+        DATA_CAPACITY
+            - self.header.slot_count as usize * size_of::<Slot>()
+            - self.header.space_used as usize
     }
 
     #[inline]
@@ -794,7 +859,7 @@ impl Node {
 
         let dst_len = dst.len();
         let len = self.prefix().len() + slot.key_len as usize;
-        debug_assert!(dst_len >= len);
+        debug_assert!(dst_len >= len, "{} >= {}", dst_len, len);
 
         let mut c = Cursor::new(dst);
 
@@ -804,6 +869,16 @@ impl Node {
 
         let dst = c.into_inner();
         &dst[0..len]
+    }
+
+    pub(crate) fn all_children(&self) -> Vec<PageGuard<Node>> {
+        debug_assert!(!self.is_leaf());
+
+        self.slots().iter().map(|s| {
+            let data = self.get_data_value(*s);
+            let swip: Swip<Node> = Swip::new(usize::from_ne_bytes(data.try_into().unwrap()));
+            swip.coupled_page_guard::<Node>(None, LatchStrategy::Yolo).unwrap()
+        }).collect()
     }
 }
 
@@ -892,9 +967,30 @@ mod tests {
     }
 }
 
+impl Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
+        let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
 
+        f.debug_struct("Node")
+            .field("is_leaf", &self.is_leaf())
+            .field("height", &self.header.height)
+            .field("lower_fence", &lower_fence)
+            .field("upper_fence", &upper_fence)
+            .field("prefix", &self.prefix())
+            .field("available_space", &(DATA_CAPACITY - self.header.space_used as usize))
+            .finish()
+    }
+}
 
-
+impl Debug for PageGuard<Node> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageGuard<Node>")
+            .field("ptr", &self.swip_value())
+            .field("ref", self.deref())
+            .finish()
+    }
+}
 
 
 

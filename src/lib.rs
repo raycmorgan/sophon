@@ -11,7 +11,7 @@
 mod btree2;
 mod buffer_manager;
 
-trait DiskManager {
+trait DiskManager: Sync + Send {
     fn capacity(&self) -> usize;
     fn base_page_size(&self) -> usize;
 
