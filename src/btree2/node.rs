@@ -1,11 +1,9 @@
-use std::{mem::{size_of, ManuallyDrop}, sync::atomic::AtomicU64, ops::{Range, Index, Deref}, fmt::Debug};
+use std::{mem::size_of, ops::{Range, Deref}, fmt::Debug};
 use log::debug;
-use parking_lot::RawRwLock;
-use stackvec::{StackVec, TryCollect};
 
 use crate::buffer_manager::{
-    buffer_frame::{USABLE_PAGE_SIZE, ExclusiveGuard, PageGuard, LatchStrategy},
-    swip::Swip
+    buffer_frame::{/*USABLE_PAGE_SIZE,*/ PageGuard, LatchStrategy},
+    swip::Swip, Swipable
 };
 
 pub(crate) const MAX_KEY_LEN: usize = 4096;
@@ -13,12 +11,13 @@ pub(crate) const MAX_KEY_LEN: usize = 4096;
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug)]
 struct Fence {
-    pos: u16,
-    len: u16,
+    pos: u32,
+    len: u32,
 }
 
 impl Fence {
     fn as_range(&self) -> Range<usize> {
+        // println!("pos: {}, len: {}", self.pos, self.len);
         self.pos as usize .. (self.pos + self.len) as usize
     }
 }
@@ -30,41 +29,41 @@ struct NodeHeader {
     pid: u64,
     height: u32,
 
-    // upper_swip: Option<[u8; size_of::<Swip<Node>>()]>,
-
     lower_fence: Fence,
     upper_fence: Fence,
 
-    // move to BufferFrame
-    // version: AtomicU64,
-    // latch: RawRwLock,
-
     is_leaf: bool,
     slot_count: u16,
-    space_used: u16,
-    space_active: u16,
     prefix_len: u16,
+    space_used: u32,
+    space_active: u32,
+    data_capacity: u32,
 }
+
+const SLOT_KEY_LEN: usize = 6;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Slot {
-    key: [u8; 4], // add 6 here?
-    data_ptr: u16,
-    data_len: u16,
+    key: [u8; SLOT_KEY_LEN], // add 6 here?
+    data_ptr: u32,
+    data_len: u32,
     key_len: u16, // 10 :(
 }
 
-const RAW_ALIGN_OFFSET: usize = (size_of::<NodeHeader>() % 8).abs_diff(8) % 8;
-const RAW_SIZE: usize = USABLE_PAGE_SIZE - size_of::<NodeHeader>() - RAW_ALIGN_OFFSET;
-const SLOTS_CAPACITY: usize = RAW_SIZE / std::mem::size_of::<Slot>();
-const DATA_CAPACITY: usize = SLOTS_CAPACITY * size_of::<Slot>();
+// const RAW_ALIGN_OFFSET: usize = (size_of::<NodeHeader>() % 8).abs_diff(8) % 8;
+// const RAW_SIZE: usize = USABLE_PAGE_SIZE - size_of::<NodeHeader>() - RAW_ALIGN_OFFSET;
+// const SLOTS_CAPACITY: usize = RAW_SIZE / std::mem::size_of::<Slot>();
+// const DATA_CAPACITY: usize = SLOTS_CAPACITY * size_of::<Slot>();
 
 
 #[repr(C, packed)]
 union NodeContents {
-    slots: [Slot; SLOTS_CAPACITY],
-    data: [u8; DATA_CAPACITY],
+    // slots: [Slot; SLOTS_CAPACITY],
+    // data: [u8; DATA_CAPACITY],
+
+    // Placeholder. Valid memory is actually header.data_capacity
+    data: [u8; 0],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,16 +77,29 @@ pub(crate) struct Node {
     contents: NodeContents
 }
 
+const RAW_ALIGN_OFFSET: usize = (size_of::<NodeHeader>() % 8).abs_diff(8) % 8;
+
+impl Swipable for Node {
+    fn set_backing_len(&mut self, len: usize) {
+        let raw_size = len - size_of::<NodeHeader>() - RAW_ALIGN_OFFSET;
+        let slot_capacity = raw_size / std::mem::size_of::<Slot>();
+        let data_capacity = slot_capacity * size_of::<Slot>();
+        // println!("data_capacity: {}", data_capacity);
+        // const RAW_SIZE: usize = USABLE_PAGE_SIZE - size_of::<NodeHeader>() - RAW_ALIGN_OFFSET;
+        // const SLOTS_CAPACITY: usize = RAW_SIZE / std::mem::size_of::<Slot>();
+        // const DATA_CAPACITY: usize = SLOTS_CAPACITY * size_of::<Slot>();
+
+        self.header.data_capacity = data_capacity.try_into().expect("len <= u32");
+    }
+}
+
 impl Node {
     pub(crate) fn init_header(
         &mut self,
         db_version: u32,
         pid: u64,
         height: u32,
-
-        // upper_swip: Option<[u8; size_of::<Swip<Node>>()]>,
         is_leaf: bool,
-
         lower_fence: &[u8],
         upper_fence: &[u8],
     ) {
@@ -104,27 +116,34 @@ impl Node {
         // self.header.upper_swip = upper_swip;
         self.header.is_leaf = is_leaf;
         self.header.slot_count = 0;
-        self.header.prefix_len = prefix.len() as u16;
+        self.header.prefix_len = prefix.len().try_into().unwrap();
+        // self.header.data_capacity = DATA_CAPACITY as u32;
 
-        self.header.space_used = (prefix.len() + lower_fence.len() + upper_fence.len()) as u16;
-        self.header.space_active = (prefix.len() + lower_fence.len() + upper_fence.len()) as u16;
+        debug_assert!(self.header.data_capacity != 0);
 
+        self.header.space_used = (prefix.len() + lower_fence.len() + upper_fence.len()).try_into().unwrap();
+        self.header.space_active = (prefix.len() + lower_fence.len() + upper_fence.len()).try_into().unwrap();
+
+        let data_capacity = self.header.data_capacity;
         let data_len = self.data().len();
         let mut_data = self.data_mut();
+
+        // println!("self.header.data_capacity: {}, data_len: {}", data_capacity, data_len);
 
         mut_data[data_len-prefix.len()..].copy_from_slice(prefix);
 
         let lowerf = Fence {
-            len: lower_fence.len() as u16,
-            pos: (data_len-prefix.len()-lower_fence.len()) as u16
+            len: lower_fence.len().try_into().unwrap(),
+            pos: (data_len-prefix.len()-lower_fence.len()).try_into().unwrap()
         };
 
         mut_data[lowerf.as_range()]
             .copy_from_slice(lower_fence);
 
+        let upperflen: u32 = upper_fence.len().try_into().unwrap();
         let upperf = Fence {
-            len: upper_fence.len() as u16,
-            pos: lowerf.pos - upper_fence.len() as u16,
+            len: upper_fence.len().try_into().unwrap(),
+            pos: lowerf.pos - upperflen,
         };
 
         mut_data[upperf.as_range()]
@@ -141,7 +160,8 @@ impl Node {
     fn testable() -> Node {
         Node {
             header: NodeHeader::default(),
-            contents: NodeContents { data: [0u8; SLOTS_CAPACITY * size_of::<Slot>()] },
+            // contents: NodeContents { data: [0u8; SLOTS_CAPACITY * size_of::<Slot>()] },
+            contents: NodeContents { data: [] },
         }
     }
 
@@ -183,8 +203,8 @@ impl Node {
         self.data_mut()[data_ptr..data_ptr+key_parts.1.len()].copy_from_slice(&key_parts.1);
         self.data_mut()[value_ptr..value_ptr+value.len()].copy_from_slice(&value);
 
-        self.header.space_used += data_len as u16;
-        self.header.space_active += data_len as u16;
+        self.header.space_used += data_len as u32;
+        self.header.space_active += data_len as u32;
 
         let pos = match self.search(&key_parts) {
             Ok(pos) => {
@@ -196,7 +216,8 @@ impl Node {
                 
                 if pos < slot_count {
                     unsafe {
-                        self.contents.slots.copy_within(pos..slot_count, pos + 1);
+                        // self.contents.slots.copy_within(pos..slot_count, pos + 1);
+                        self.slots_mut_unbounded().copy_within(pos..slot_count, pos + 1);
                     }
                 }
 
@@ -205,19 +226,15 @@ impl Node {
             }
         };
 
-        // if !self.is_leaf() && pos == (self.header.slot_count - 1) {
-        //     // Special case: need to move the upper swip into the
-        //     // slot, and bump the 
-        // }
-
         unsafe {
-            let mut k = [0u8; 4];
+            let mut k = [0u8; SLOT_KEY_LEN];
             k[0..key_parts.0.len()].copy_from_slice(&key_parts.0[0..]);
 
-            self.contents.slots[pos] = Slot {
+            // self.contents.slots[pos] = Slot {
+            self.slots_mut_unbounded()[pos] = Slot {
                 key: k,
-                data_ptr: data_ptr as u16,
-                data_len: value.len() as u16,
+                data_ptr: data_ptr as u32,
+                data_len: value.len() as u32,
                 key_len: key_len as u16,
             }
         }
@@ -243,67 +260,19 @@ impl Node {
     }
 
     pub(crate) fn get_next(&self, key: &[u8]) -> Option<&[u8]> {
-        debug_assert!(key.len() < 1024 * 8);
+        debug_assert!(key.len() < MAX_KEY_LEN);
         debug_assert!(&key[..self.header.prefix_len as usize] == self.prefix());
 
         let key = &key[self.header.prefix_len as usize..];
         let key_parts = key_parts(&key);
 
-        // let idx = self.search(&key_parts).unwrap_or_else(|i| i);
-
-        // [a, d, e, m]
-        // a => 0
-        // b => 0
-        // d => 1
-        // e => 2
-        // m => 3
-
         let pos = match self.search(&key_parts) {
-            Ok(pos) => {
-                pos
-
-                // let slot = self.slots()[pos];
-                // Some(self.get_data_value(slot))
-            }
-
-            Err(pos) => {
-                if pos == 0 {
-                    panic!("Key: {:?}\nSlot[0]: {:?}\nNode: {:?}", key, self.slots()[0], self);
-                }
-
-                pos - 1
-            }
+            Ok(pos) => pos,
+            Err(pos) => pos - 1,
         };
 
         let slot = self.slots()[pos];
         Some(self.get_data_value(slot))
-
-        // if pos < self.header.slot_count as usize {
-        //     let slot = self.slots()[pos];
-        //     Some(self.get_data_value(slot))
-        // } else {
-        //     self.header.upper_swip
-        //         .as_ref()
-        //         .map(|s| &s[..])
-        // }
-
-        // match self.search(&key_parts) {
-        //     Ok(pos) => {
-        //         let slot = self.slots()[pos];
-        //         Some(self.get_data_value(slot))
-        //     }
-
-        //     Err(pos) => {
-        //         if pos < self.header.slot_count as usize {
-        //             let slot = self.slots()[pos];
-        //             Some(self.get_data_value(slot))
-        //         } else {
-        //             self.header.upper_swip
-        //                 .as_ref()
-        //                 .map(|s| &s[..])
-        //         }
-        //     }
-        // }
     }
 
     #[inline]
@@ -339,124 +308,6 @@ impl Node {
         // }
 
         return self.copy_key(pivot_slot, dst);
-
-
-        // if key <= pivot_key
-
-        
-
-        // let trimmed_key = &key[self.header.prefix_len as usize..];
-        // let key_parts = key_parts(&trimmed_key);
-        // let mut split_idx = self.search(&key_parts).unwrap_or_else(|p| p);
-        // let count = self.header.slot_count as usize;
-        // let mid = count / 2;
-        // let slots = self.slots();
-
-        // // Let's just split at the mid point for now
-        // split_idx = mid;
-
-        // // if split_idx == count {
-        // //     todo!("implement right most entry optimization");
-        // // }
-
-        // // let slot_usages = slots.iter().map(|s| {
-        // //     (s.data_len + s.key_len) as usize + size_of::<Slot>()
-        // // });
-
-        // // slot_usages.windows(2).enumerate().map(|(i, usage)| {
-            
-        // // });
-
-        // // slots.windows(2).fold()
-
-        // let (left, right) = slots.iter()
-        //     .enumerate()
-        //     .fold((0,0), |(l,r), (i, slot)| {
-        //         if i < split_idx {
-        //             (l + (slot.data_len + slot.key_len) as usize, r)
-        //         } else {
-        //             (l, r + (slot.data_len + slot.key_len) as usize)
-        //         }
-        //     });
-
-        // loop {
-        //     let left_overhead = split_idx * size_of::<Slot>();
-        //     let right_overhead = (slots.len() - split_idx) * size_of::<Slot>();
-        //     let prefix_len = self.header.prefix_len as usize;
-        //     let pivot = slots[split_idx];
-        //     let split_key = (
-        //         &pivot.key[0..pivot.key_len.min(4) as usize],
-        //         self.get_data_key(pivot)
-        //     );
-
-        //     println!("key_parts: {:?} < split_key: {:?} => {}", key_parts, split_key, key_parts < split_key);
-
-        //     let out = if mid == 0 && key_parts <= split_key {
-        //         dst[0..key.len()].copy_from_slice(key);
-        //         &dst[0..key.len()]
-        //     } else {
-        //         self.copy_key(pivot, dst)
-        //     };
-
-        //     return out;
-
-
-        //     let capacity = if key_parts < split_key {
-        //         DATA_CAPACITY - left_overhead + left
-        //     } else {
-        //         DATA_CAPACITY - right_overhead + right
-        //     };
-
-        //     if capacity > size_of::<Slot>() + key_parts.1.len() + value.len() {
-        //         // return KeyChunks::new(&[self.prefix(), &split_key.0, split_key.1]);
-                
-        //         // let mut v = Vec::with_capacity(prefix_len + 4 + split_key.1.len());
-        //         // v[0..prefix_len].copy_from_slice(self.prefix());
-        //         // v[prefix_len..prefix_len+4].copy_from_slice(&split_key.0);
-        //         // v[prefix_len+4..].copy_from_slice(split_key.1);
-
-        //         // // TODO: Just return the parts as references
-
-        //         // return v;
-
-        //         // use std::io::{Write, Cursor};
-
-        //         // let mut c = Cursor::new(dst);
-
-        //         // c.write(self.prefix()).expect("infallible");
-        //         // c.write(&split_key.0).expect("infallible");
-        //         // c.write(&split_key.1).expect("infallible");
-
-        //         // let dst = c.into_inner();
-
-        //         // // dst[0..prefix_len].copy_from_slice(self.prefix());
-        //         // // dst[prefix_len..prefix_len+4].copy_from_slice(&split_key.0);
-        //         // // dst[prefix_len+4..].copy_from_slice(split_key.1);
-
-        //         // let len = prefix_len + 4 + split_key.1.len();
-
-        //         // if 
-        //         let out = self.copy_key(pivot, dst);
-
-        //         println!("dst: {:?}", out);
-        //         return &out;
-        //     } else {
-        //         todo!(r#"
-        //             We don't have enough space to perform an insert. 
-        //             Shift pivot key, multi-split, use large page?
-        //         "#);
-
-        //         // We don't have enough space to perform the insert, shift the pivot key
-
-        //         // [1-4, 3-4, 7-4, 8-3]
-        //         // insert: 6-10
-
-        //         // [1, 3, 6] [7, 8]
-        //         // [1, 3] [6, 7, 8]
-        //         // [1], [3, 6, 7, 8]
-        //         // [1, 3, 6, 7] [8]
-        //     }
-        // }
     }
 
     #[inline]
@@ -472,15 +323,11 @@ impl Node {
         #[cfg(debug_assertions)]
         let slot_count = self.header.slot_count;
 
-        // let pivot = self.search(&key_parts(&pivot_key))
-        //     .map(|i| i)
-        //     .unwrap_or_else(|e| e);
         let pivot_slot = self.slots()[pivot];
 
         let mut temp = [0u8; MAX_KEY_LEN];
         let split_key = self.copy_key(pivot_slot, &mut temp);
 
-        // debug!("[split] Splitting non-root: {} at {:?}:{} | pivot_key: {:?}", self.header.pid, split_key, pivot, pivot_key);
         debug!("[split] Lower fence: {:?}, Upper fence: {:?}", self.lower_fence(), self.upper_fence());
 
         let pid = right.pid();
@@ -488,7 +335,6 @@ impl Node {
             1,
             pid,
             self.header.height,
-            // self.header.upper_swip, // todo: steal from left
             self.is_leaf(),
             &split_key,
             self.upper_fence(),
@@ -497,15 +343,6 @@ impl Node {
         debug!("[split] Created Right Peer {}, is_leaf: {}", pid, right.is_leaf());
 
         let mut i = pivot;
-
-        // if !self.is_leaf() {
-        //     // let value = self.get_data_value(pivot_slot);
-        //     // self.header.upper_swip = Some(value.try_into().expect("len match"));
-        // }
-        //       v
-        // [c, e, g, m, z]
-        //       |->
-
 
         let slots = self.slots();
         while let Some(slot) = slots.get(i) {
@@ -553,10 +390,14 @@ impl Node {
     fn compact(&mut self, tmp_buffer: &mut [u8], upper_fence: Option<&[u8]>) {
         // let tmp = [0u8; DATA_CAPACITY];
 
-        let mut tmp = Node {
-            header: Default::default(),
-            contents: NodeContents { data: [0u8; DATA_CAPACITY] }
+        let mut tmp: &mut Node = unsafe {
+            let mut backing: Box<[std::mem::MaybeUninit<u8>]> = 
+                Box::new_zeroed_slice(
+                    size_of::<Node>() + self.header.data_capacity as usize);
+            std::mem::transmute(backing.as_mut_ptr())
         };
+
+        tmp.header.data_capacity = self.header.data_capacity;
 
         tmp.init_header(
             1, 
@@ -738,33 +579,11 @@ impl Node {
         // data within this node and a unlikely (but possible) structural
         // causes slot length to change which would cause the  interal pointers
         // to be incorrect (outside of the bounds)
-    
-        #[cfg(debug_assertions)] {
-            let mut str = String::with_capacity(DATA_CAPACITY);
-
-            str.push_str("Slots: <");
-
-            for slot in self.slots() {
-                if self.is_leaf() {
-                    // str.push_str(slot.key);
-                    // str.push_str("=>{}, ");
-                    // str.push_str(&format!("{:?}=>{}, ", slot.key, slot.data_len));
-                } else {
-                    // str.push_str(&format!("{:?}=>{:?}, ", 
-                    //     slot.key, 
-                    //     u64::from_ne_bytes(self.get_data_value(*slot).try_into().unwrap())
-                    // ));
-                }
-            }
-            str.push_str(" >");
-            // print!("{:?}", self.header.upper_swip.map(|s| u64::from_ne_bytes(s)));
-            debug!("{}", str);
-        }
 
         self.slots().binary_search_by(|s| {
             use std::cmp::Ordering;
 
-            let sk = &s.key[0..s.key_len.min(4) as usize];
+            let sk = &s.key[0..s.key_len.min(SLOT_KEY_LEN as u16) as usize];
 
             match sk.cmp(slot_key) {
                 Ordering::Greater => Ordering::Greater,
@@ -788,7 +607,11 @@ impl Node {
         // Safety: We know the contents can always be considered an &[u8].
         // ~We're additionally ensuring not to overwrite any slots.~
         unsafe {
-            &self.contents.data[..] //offset..]
+            // &self.contents.data[..] //offset..]
+            std::slice::from_raw_parts(
+                self.contents.data.as_ptr(), 
+                self.header.data_capacity as usize
+            )
         }
     }
 
@@ -799,20 +622,42 @@ impl Node {
         // Safety: We know the contents can always be considered an &[u8].
         // ~We're additionally ensuring not to overwrite any slots.~
         unsafe {
-            &mut self.contents.data[..]
+            // &mut self.contents.data[..]
+
+            std::slice::from_raw_parts_mut(
+                self.contents.data.as_mut_ptr(), 
+                self.header.data_capacity as usize
+            )
         }
     }
 
     #[inline]
     fn slots(&self) -> &[Slot] {
         unsafe {
-            &self.contents.slots[0..self.header.slot_count as usize]
+            // &self.contents.slots[0..self.header.slot_count as usize]
+
+            std::slice::from_raw_parts(
+                self.contents.data.as_ptr() as *const Slot, 
+                self.header.slot_count as usize
+            )
+        }
+    }
+
+    #[inline]
+    fn slots_mut_unbounded(&mut self) -> &mut [Slot] {
+        unsafe {
+            // &self.contents.slots[0..self.header.slot_count as usize]
+
+            std::slice::from_raw_parts_mut(
+                self.contents.data.as_mut_ptr() as *mut Slot, 
+                self.header.data_capacity as usize / size_of::<Slot>()
+            )
         }
     }
 
     #[inline]
     fn available_space(&self) -> usize {
-        DATA_CAPACITY
+        self.header.data_capacity as usize
             - self.header.slot_count as usize * size_of::<Slot>()
             - self.header.space_used as usize
     }
@@ -826,14 +671,14 @@ impl Node {
     #[inline]
     fn get_data_key(&self, slot: Slot) -> &[u8] {
         let dp = slot.data_ptr as usize;
-        let key_len = slot.key_len.saturating_sub(4) as usize;
+        let key_len = slot.key_len.saturating_sub(SLOT_KEY_LEN as u16) as usize;
         &self.data()[dp..dp+key_len]
     }
 
     #[inline]
     fn get_data_value(&self, slot: Slot) -> &[u8] {
         let dp = slot.data_ptr as usize;
-        let key_len = slot.key_len.saturating_sub(4) as usize;
+        let key_len = slot.key_len.saturating_sub(SLOT_KEY_LEN as u16) as usize;
         let pos = dp + key_len;
         &self.data()[pos..pos+slot.data_len as usize]
     }
@@ -864,7 +709,7 @@ impl Node {
         let mut c = Cursor::new(dst);
 
         c.write(self.prefix()).expect("infallible");
-        c.write(&slot.key[0..slot.key_len.min(4) as usize]).expect("infallible");
+        c.write(&slot.key[0..slot.key_len.min(SLOT_KEY_LEN as u16) as usize]).expect("infallible");
         c.write(self.get_data_key(slot)).expect("infallible");
 
         let dst = c.into_inner();
@@ -885,20 +730,17 @@ impl Node {
 type KeyParts<'a> = (&'a [u8], &'a [u8]);
 
 #[inline]
-fn slot_key(key: &[u8]) -> [u8; 4] {
-    [
-        *key.get(0).unwrap_or(&0),
-        *key.get(1).unwrap_or(&0),
-        *key.get(2).unwrap_or(&0),
-        *key.get(3).unwrap_or(&0),
-    ]
+fn slot_key(key: &[u8]) -> [u8; SLOT_KEY_LEN] {
+    let mut k = [0u8; SLOT_KEY_LEN];
+    k.copy_from_slice(&key[0..SLOT_KEY_LEN.min(key.len())]);
+    k
 }
 
 #[inline]
 fn key_parts(key: &[u8]) -> KeyParts {
     (
-        &key[0..key.len().min(4)], // slot_key(&key),
-        if key.len() <= 4 { b"" } else { &key[4..] }
+        &key[0..key.len().min(SLOT_KEY_LEN)], // slot_key(&key),
+        if key.len() <= SLOT_KEY_LEN { b"" } else { &key[SLOT_KEY_LEN..] }
     )
 }
 
@@ -969,16 +811,18 @@ mod tests {
 
 impl Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
-        let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
+        // let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
+        // let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
 
         f.debug_struct("Node")
             .field("is_leaf", &self.is_leaf())
             .field("height", &self.header.height)
-            .field("lower_fence", &lower_fence)
-            .field("upper_fence", &upper_fence)
-            .field("prefix", &self.prefix())
-            .field("available_space", &(DATA_CAPACITY - self.header.space_used as usize))
+            .field("lower_fence", &self.header.lower_fence)
+            .field("upper_fence", &self.header.upper_fence)
+            // .field("lower_fence", &lower_fence)
+            // .field("upper_fence", &upper_fence)
+            // .field("prefix", &self.prefix())
+            // .field("available_space", &(self.header.data_capacity as usize - self.header.space_used as usize))
             .finish()
     }
 }

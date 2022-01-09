@@ -1,17 +1,12 @@
 use std::{mem::size_of, sync::atomic::{AtomicU64, Ordering}, marker::PhantomData};
 use parking_lot::{RawRwLock as RwLock, lock_api::{RawRwLock, RawRwLockUpgrade}};
 
-mod exclusive_guard;
-mod shared_guard;
-mod optimistic_guard;
 mod page_guard;
 
-pub(crate) use exclusive_guard::ExclusiveGuard;
-pub(crate) use shared_guard::{SharedGuard, SharedGuard2};
-pub(crate) use optimistic_guard::{OptimisticGuard, OptimisticError};
 pub(crate) use page_guard::{PageGuard, LatchStrategy};
 pub(crate) const PAGE_SIZE: usize = 1024 * 16;
-pub(crate) const USABLE_PAGE_SIZE: usize = PAGE_SIZE - size_of::<u64>();
+pub(crate) const PAGE_DATA_RESERVED: usize = size_of::<u64>();
+// pub(crate) const USABLE_PAGE_SIZE: usize = PAGE_SIZE - size_of::<u64>();
 
 struct Header {
     version: AtomicU64,
@@ -83,7 +78,9 @@ impl<'a> BufferFrame<'a> {
 #[repr(C)]
 pub(crate) struct Page {
     gsn: u64,
-    data: [u8; USABLE_PAGE_SIZE],
+    // Placeholder -- real len in noted self contained inside data,
+    // it is at least large enough to know its own length
+    data: [u8; 0] // [u8; USABLE_PAGE_SIZE],
 }
 
 #[cfg(test)]
@@ -92,7 +89,7 @@ mod tests {
 
     #[test]
     fn constants_make_sense() {
-        assert_eq!(PAGE_SIZE, std::mem::size_of::<Page>());
+        // assert_eq!(PAGE_SIZE, std::mem::size_of::<Page>());
     }
 
     #[test]

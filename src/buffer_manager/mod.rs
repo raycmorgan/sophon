@@ -1,5 +1,5 @@
 use crate::{DiskManager, DiskManagerAllocError, buffer_manager::swip::Swip};
-use std::fmt;
+use std::{fmt, mem::size_of};
 use std::sync::Arc;
 use std::cell::UnsafeCell;
 use log::debug;
@@ -7,7 +7,7 @@ use madvise::AdviseMemory;
 use memmap::MmapMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use self::buffer_frame::BufferFrame;
+use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED};
 
 pub(crate) mod swip;
 pub(crate) mod buffer_frame;
@@ -18,6 +18,10 @@ pub(crate) struct BufferManager {
     max_memory: usize,
     page_classes: Vec<PageClass>,
     version_boundary: AtomicU64,
+}
+
+pub(crate) trait Swipable {
+    fn set_backing_len(&mut self, len: usize);
 }
 
 impl fmt::Debug for BufferManager {
@@ -50,7 +54,7 @@ impl BufferManager {
         }
     }
 
-    pub fn new_page<T>(&self) -> Result<Swip<T>, DiskManagerAllocError> {
+    pub fn new_page<T: Swipable>(&self) -> Result<Swip<T>, DiskManagerAllocError> {
         let page_id = self.disk_manager.allocate_page(0)?;
         let page: &mut buffer_frame::Page = unsafe {
             std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr())
@@ -58,6 +62,10 @@ impl BufferManager {
 
         let bf = Box::new(BufferFrame::new(page));
         let swip = Swip::new(bf.as_ref() as *const _ as usize);
+
+        let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
+        guard.set_backing_len(self.page_classes[0].page_size - PAGE_DATA_RESERVED);
+        std::mem::drop(guard);
 
         // manually managed memory
         // TODO: move this to preallocated frames instead of alloc on new_page
@@ -138,7 +146,7 @@ impl PageClass {
     /// any potential data races.
     unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
-        debug!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
+        // println!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
 
         let mmap = self.mmap.get().as_mut().unwrap();
         &mut mmap[start..start+self.page_size]

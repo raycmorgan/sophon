@@ -4,12 +4,12 @@ use std::sync::Arc;
 use log::debug;
 use stackvec::StackVec;
 
-use crate::buffer_manager::{BufferManager, swip::Swip, buffer_frame::{ExclusiveGuard, OptimisticError, PageGuard, SharedGuard2, LatchStrategy}};
+use crate::buffer_manager::swip::OptimisticError;
+use crate::buffer_manager::{BufferManager, swip::Swip, buffer_frame::{PageGuard, LatchStrategy}};
 
 use self::node::{Node, MAX_KEY_LEN};
 
 mod node;
-mod node_path;
 // mod key_chunks;
 
 #[derive(Debug, PartialEq)]
@@ -45,7 +45,7 @@ struct BTree {
 impl BTree {
     pub fn new(buffer_manager: Arc<BufferManager>) -> Self {
         let root_swip: Swip<Node> = buffer_manager.new_page().unwrap();
-        let mut node = root_swip.exclusive_lock();
+        let mut node = root_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
         node.init_header(
             1,
             root_swip.page_id(),

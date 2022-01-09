@@ -1,25 +1,30 @@
 use std::fmt::Debug;
 use crate::{buffer_manager::buffer_frame::BufferFrame};
-use super::buffer_frame::{ExclusiveGuard, OptimisticGuard, OptimisticError, SharedGuard, PageGuard, LatchStrategy, Page};
+use super::{buffer_frame::{PageGuard, LatchStrategy}, Swipable};
 
-pub(crate) struct Swip<T> {
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum OptimisticError {
+    Conflict
+}
+
+pub(crate) struct Swip<T: Swipable> {
     ptr: usize, // either pid or pointer to BufferFrame
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> From<usize> for Swip<T> {
+impl<T: Swipable> From<usize> for Swip<T> {
     fn from(ptr: usize) -> Self {
         Swip { ptr, _marker: Default::default() }
     }
 }
 
-impl<T> From<Swip<T>> for usize {
+impl<T: Swipable> From<Swip<T>> for usize {
     fn from(swip: Swip<T>) -> Self {
         swip.ptr
     }
 }
 
-impl<T> Clone for Swip<T> {
+impl<T: Swipable> Clone for Swip<T> {
     fn clone(&self) -> Self {
         Swip {
             ptr: self.ptr,
@@ -28,9 +33,9 @@ impl<T> Clone for Swip<T> {
     }
 }
 
-impl<T> Copy for Swip<T> {}
+impl<T: Swipable> Copy for Swip<T> {}
 
-impl<T> Debug for Swip<T> {
+impl<T: Swipable> Debug for Swip<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Swip")
             .field("ptr", &self.ptr)
@@ -38,13 +43,13 @@ impl<T> Debug for Swip<T> {
     }
 }
 
-impl<T> PartialEq for Swip<T> {
+impl<T: Swipable> PartialEq for Swip<T> {
     fn eq(&self, other: &Self) -> bool {
         self.ptr == other.ptr
     }
 }
 
-impl<T> Swip<T> {
+impl<T: Swipable> Swip<T> {
     pub(crate) fn new(ptr: usize) -> Self {
         Swip {
             ptr,
@@ -93,32 +98,12 @@ impl<T> Swip<T> {
     }
 
     #[inline]
-    pub(crate) fn exclusive_lock(self) -> ExclusiveGuard<T> {
-        ExclusiveGuard::new(self)
-    }
-
-    // #[inline]
-    // pub(crate) fn exclusive_lock2(self) -> ExclusiveGuard2<T> {
-    //     ExclusiveGuard2::new(self)
-    // }
-
-    #[inline]
-    pub(crate) fn shared_lock(&self) -> SharedGuard<T> {
-        SharedGuard::new(self)
-    }
-
-    #[inline]
     pub(crate) fn page_guard(self) -> PageGuard<T> {
         PageGuard::new_optimistic_or_shared(self)
     }
 
     #[inline]
-    pub(crate) fn optimistic_guard(&self) -> Result<OptimisticGuard<T>, OptimisticError> {
-        OptimisticGuard::new(self)
-    }
-
-    #[inline]
-    pub(crate) fn coupled_page_guard<T2>(self, parent: Option<&PageGuard<T2>>, strategy: LatchStrategy) -> Result<PageGuard<T>, OptimisticError> {
+    pub(crate) fn coupled_page_guard<T2: Swipable>(self, parent: Option<&PageGuard<T2>>, strategy: LatchStrategy) -> Result<PageGuard<T>, OptimisticError> {
         let guard = match strategy {
             LatchStrategy::OptimisticSpin => PageGuard::new_optimistic_spin(self),
             LatchStrategy::OptimisticOrShared => PageGuard::new_optimistic_or_shared(self),

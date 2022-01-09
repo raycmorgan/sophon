@@ -4,6 +4,7 @@
 
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
+#![feature(new_uninit)]
 
 // assert_eq!(8, std::mem::size_of::<parking_log::RWLock<()>>());
 

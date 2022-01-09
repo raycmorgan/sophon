@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 
+use crate::buffer_manager::Swipable;
 use crate::buffer_manager::buffer_frame::BufferFrame;
 use crate::buffer_manager::swip::Swip;
 
@@ -22,13 +23,13 @@ pub(crate) enum LatchStrategy {
     Yolo,
 }
 
-pub(crate) struct PageGuard<T> {
+pub(crate) struct PageGuard<T: Swipable> {
     swip: Swip<T>,
     initial_version: u64,
     state: LockState,
 }
 
-impl<T> PageGuard<T> {
+impl<T: Swipable> PageGuard<T> {
     pub(crate) fn new_optimistic_spin(swip: Swip<T>) -> Self {
         let frame = unsafe { swip.as_buffer_frame() };
         let state = LockState::Optimistic;
@@ -126,9 +127,11 @@ impl<T> PageGuard<T> {
 
     #[inline]
     pub(crate) fn data_structure(&self) -> &T {
-        let frame = unsafe { self.swip.as_buffer_frame() };
-        let ptr = frame.page.data.as_ptr();
-        unsafe { std::mem::transmute(ptr.as_ref().unwrap()) }
+        unsafe {
+            let frame = self.swip.as_buffer_frame();
+            let ptr = frame.page.data.as_ptr();
+            std::mem::transmute(ptr.as_ref().unwrap())
+        }
     }
 
     #[inline]
@@ -138,6 +141,11 @@ impl<T> PageGuard<T> {
         let frame = unsafe { self.swip.as_buffer_frame_mut() };
         let ptr = frame.page.data.as_mut_ptr();
         unsafe { std::mem::transmute(ptr.as_mut().unwrap()) }
+    }
+
+    pub(crate) fn set_backing_len(&mut self, len: usize) {
+        let ds = self.data_structure_mut();
+        ds.set_backing_len(len);
     }
 
     #[inline]
@@ -223,7 +231,7 @@ impl<T> PageGuard<T> {
     }
 }
 
-impl<T> Drop for PageGuard<T> {
+impl<T: Swipable> Drop for PageGuard<T> {
     fn drop(&mut self) {
         // Safety: SharedGuard takes a shared latch when created, thus
         // we know we own a latch.
@@ -239,7 +247,7 @@ impl<T> Drop for PageGuard<T> {
     }
 }
 
-impl<T> Deref for PageGuard<T> {
+impl<T: Swipable> Deref for PageGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -247,7 +255,7 @@ impl<T> Deref for PageGuard<T> {
     }
 }
 
-impl<T> DerefMut for PageGuard<T>  {
+impl<T: Swipable> DerefMut for PageGuard<T>  {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.data_structure_mut()
     }
