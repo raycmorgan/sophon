@@ -554,15 +554,6 @@ impl Node {
                     debug_assert!(n.upper_fence() >= max_key, "{}: {:?} >= {:?}", name, n.upper_fence(), max_key);
                 }
             }
-
-
-            
-
-            // let slots = right.slots();
-            // let min_key = right.copy_key(slots[0], &mut temp);
-            // debug_assert!(right.lower_fence() < min_key, "{:?} < {:?}", right.lower_fence(), min_key);
-            // let max_key = right.copy_key(*slots.last().expect("infallible"), &mut temp);
-            // debug_assert!(right.upper_fence() >= max_key, "{:?} < {:?}", right.upper_fence(), max_key);
         }
     }
 

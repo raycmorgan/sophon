@@ -165,11 +165,6 @@ impl BTree {
 
                     parent.root_split(&mut left, &mut right, pivot);
 
-                    println!("RESTART");
-                    continue 'outer;
-
-                    // key < left.upper_fence()
-
                     let s = node.get_next(&key).expect("All inner nodes should return _something_");
 
                     let n = if s == left.swip_bytes() {
@@ -314,14 +309,6 @@ impl BTree {
     }
 }
 
-// impl<'a> Debug for BTree<'a> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         f.debug_struct("BTree")
-//             .field("root", self.root_page)
-//             .finish()
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use std::{time::Instant, thread};
@@ -350,7 +337,6 @@ mod tests {
         let btree = BTree::new(bm);
         btree.insert(b"foo", &[1u8; 1028 * 10]).unwrap();
         btree.insert(b"bar", &[2u8; 1028 * 10]).unwrap();
-
         btree.insert(b"mmm", &[3u8; 1028 * 10]).unwrap();
 
         assert_eq!(Some([1u8; 1028 * 10].to_vec()), btree.get(b"foo").unwrap());
