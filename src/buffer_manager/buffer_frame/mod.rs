@@ -34,14 +34,11 @@ impl<'a> BufferFrame<'a> {
         }
     }
 
-    pub(crate) fn new(page: &'a mut Page) -> Self {
-        BufferFrame {
-            header: Header {
-                version: AtomicU64::new(0),
-                latch: RwLock::INIT,
-            },
-            page
-        }
+    pub(crate) unsafe fn init<'b>(bf: *mut BufferFrame<'b>, page: &'b mut Page) {
+        let mut frame = bf.as_mut().expect("reference");
+        frame.header.version = AtomicU64::new(0);
+        frame.header.latch = RwLock::INIT;
+        frame.page = page;
     }
 
     fn latch_exclusive(&self) {

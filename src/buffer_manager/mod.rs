@@ -18,7 +18,11 @@ pub(crate) struct BufferManager {
     max_memory: usize,
     page_classes: Vec<PageClass>,
     version_boundary: AtomicU64,
+    frames: UnsafeCell<MmapMut>,
 }
+
+unsafe impl Send for BufferManager {}
+unsafe impl Sync for BufferManager {}
 
 pub(crate) trait Swipable {
     fn set_backing_len(&mut self, len: usize);
@@ -45,12 +49,23 @@ impl BufferManager {
             class_size *= 2;
         }
 
+        // Preallocate all possible frames, which is limited based on how much
+        // memory we reserve for the BufferManager and the smallest page size.
+        // We never delloc (for the duration of the BufferManager) these slots
+        // as there can always be live pointers. Additionally, we never decrease
+        // the version of a Frame (even if the underlying page is unswizzled)
+        // once it is init'ed, which ensures optimistic latches never see an
+        // invalid page.
+        let max_frames =  max_memory / base_page_size;
+        let frames = UnsafeCell::new(MmapMut::map_anon(max_frames).unwrap());
+
         Self {
             disk_manager,
             base_page_size,
             max_memory,
             page_classes,
             version_boundary: AtomicU64::new(0),
+            frames,
         }
     }
 
@@ -60,16 +75,21 @@ impl BufferManager {
             std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr())
         };
 
-        let bf = Box::new(BufferFrame::new(page));
-        let swip = Swip::new(bf.as_ref() as *const _ as usize);
+        // TODO: assert within range
+        let bf = unsafe {
+            self.frames
+                .get()
+                .offset((page_id * size_of::<BufferFrame>()) as isize)
+                as *mut BufferFrame
+        };
+
+        // let bf = Box::new(BufferFrame::new(page));
+        unsafe { BufferFrame::init(bf, page); }
+        let swip = Swip::new(bf as usize);
 
         let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
         guard.set_backing_len(self.page_classes[0].page_size - PAGE_DATA_RESERVED);
         std::mem::drop(guard);
-
-        // manually managed memory
-        // TODO: move this to preallocated frames instead of alloc on new_page
-        std::mem::forget(bf);
 
         Ok(swip)
 
