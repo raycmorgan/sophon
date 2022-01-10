@@ -1,4 +1,4 @@
-use std::{mem::size_of, ops::{Range, Deref}, fmt::Debug};
+use std::{mem::size_of, ops::{Range, Deref}, fmt::Debug, alloc::Allocator};
 use log::debug;
 
 use crate::buffer_manager::{
@@ -273,6 +273,41 @@ impl Node {
 
         let slot = self.slots()[pos];
         Some(self.get_data_value(slot))
+    }
+
+    pub(crate) fn delete(&self, key: &[u8]) {
+        
+    }
+
+    pub(crate) fn clone_key_values_until<A: Allocator + Clone, F>(
+        &self, upper: Option<&[u8]>, pred: F, alloc: A
+    ) -> Vec<(Box<[u8], A>, Box<[u8], A>)> 
+    where F: Fn(&[u8]) -> bool {
+        let mut tmp = [0u8; MAX_KEY_LEN];
+
+        let pivot = if let Some(u) = upper {
+            self.search(&key_parts(u)).unwrap_or_else(|e| e)
+        } else {
+            self.header.slot_count as usize
+        };
+
+        self.slots().iter()
+            .take(pivot)
+            .filter_map(|s| {
+                let value = self.get_data_value(*s);
+
+                if pred(value) {
+                    let key = self.copy_key(*s, &mut tmp);
+
+                    let k = key.to_vec_in(alloc.clone()).into_boxed_slice();
+                    let v = value.to_vec_in(alloc.clone()).into_boxed_slice();
+                    
+                    Some((k, v))
+                } else {
+                    None
+                }
+            })
+        .collect()
     }
 
     #[inline]

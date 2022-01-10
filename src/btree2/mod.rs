@@ -1,3 +1,5 @@
+use std::alloc::{Allocator, Global};
+use std::ops::Range;
 use std::{mem::size_of, fmt::Debug};
 use std::sync::Arc;
 
@@ -307,7 +309,64 @@ impl BTree {
             }
         }
     }
+
+    pub(crate) fn range<'a, F>(
+        &self, start: &[u8], end: Option<&'a [u8]>, pred: F
+    ) -> BTreeRange<'a, Global, F>
+    where F: Fn(&[u8]) -> bool + Clone {
+        self.range_in(Global.clone(), start, end, pred)
+    }
+
+    pub(crate) fn range_in<'a, F, A>(
+        &self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
+    ) -> BTreeRange<'a, A, F>
+    where F: Fn(&[u8]) -> bool, A: Allocator + Clone {
+        BTreeRange {
+            btree: self.clone(),
+            lower_fence: Some(start.to_vec()),
+            upper_bound: end,
+            pred,
+            alloc,
+        }
+    }
 }
+
+struct BTreeRange<'a, A: Allocator + Clone, F>
+    where F: Fn(&[u8]) -> bool
+{
+    btree: BTree,
+    lower_fence: Option<Vec<u8>>,
+    upper_bound: Option<&'a [u8]>,
+    alloc: A,
+    pred: F,
+}
+
+impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
+    where F: Fn(&[u8]) -> bool
+{
+    type Item = Vec<(Box<[u8], A>, Box<[u8], A>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.lower_fence.is_none() {
+            return None;
+        }
+
+        let fence = self.lower_fence.take().unwrap();
+        let (node, _) = self.btree.search_to_leaf(&fence, LatchStrategy::Shared).unwrap();
+
+        let upper_fence = node.upper_fence();
+        if upper_fence.len() == 0 {
+            self.lower_fence = None;
+        } else {
+            self.lower_fence = Some(node.upper_fence().to_vec());
+        }
+
+        Some(node.clone_key_values_until(self.upper_bound, &self.pred, self.alloc.clone()))
+    }
+}
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -325,6 +384,32 @@ mod tests {
         let btree = BTree::new(bm);
         btree.insert(b"foo", b"bar").unwrap();
         assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo").unwrap());
+    }
+
+    #[test]
+    fn basic_range_query() {
+        let dm = Arc::new(FakeDiskManager::default());
+        let bm = Arc::new(BufferManager::new(dm, 4096 * 128));
+
+        let btree = BTree::new(bm);
+        btree.insert(b"aaa", b"aaa").unwrap();
+        btree.insert(b"bbb", b"bbb").unwrap();
+        btree.insert(b"ccc", b"ccc").unwrap();
+        btree.insert(b"ddd", b"ddd").unwrap();
+        btree.insert(b"eee", b"eee").unwrap();
+        btree.insert(b"fff", b"fff").unwrap();
+
+        let range = btree.range(b"aaa", Some(b"d"), |_| true);
+        for chunk in range {
+            // println!("Chunk: {:?}", chunk);
+            for kv in chunk.iter() {
+                println!("KV: {:?}", kv);
+                // let k = &kv.0;
+                // let v = &kv.1;
+
+                // println!("k: {:?}", k[0]);
+            }
+        }
     }
 
     #[test]
