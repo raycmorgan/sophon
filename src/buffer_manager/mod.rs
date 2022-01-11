@@ -51,6 +51,7 @@ impl BufferManager {
 
         // Preallocate all possible frames, which is limited based on how much
         // memory we reserve for the BufferManager and the smallest page size.
+        //
         // We never delloc (for the duration of the BufferManager) these slots
         // as there can always be live pointers. Additionally, we never decrease
         // the version of a Frame (even if the underlying page is unswizzled)

@@ -103,6 +103,10 @@ impl Node {
         lower_fence: &[u8],
         upper_fence: &[u8],
     ) {
+        if upper_fence.len() > 0 {
+            assert!(lower_fence < upper_fence, "{:?} < {:?}", lower_fence, upper_fence);
+        }
+
         let prefix_len = lower_fence
             .iter()
             .zip(upper_fence)
@@ -837,18 +841,18 @@ mod tests {
 
 impl Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
-        // let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
+        let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
+        let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
 
         f.debug_struct("Node")
             .field("is_leaf", &self.is_leaf())
             .field("height", &self.header.height)
-            .field("lower_fence", &self.header.lower_fence)
-            .field("upper_fence", &self.header.upper_fence)
-            // .field("lower_fence", &lower_fence)
-            // .field("upper_fence", &upper_fence)
-            // .field("prefix", &self.prefix())
-            // .field("available_space", &(self.header.data_capacity as usize - self.header.space_used as usize))
+            // .field("lower_fence", &self.header.lower_fence)
+            // .field("upper_fence", &self.header.upper_fence)
+            .field("lower_fence", &lower_fence)
+            .field("upper_fence", &upper_fence)
+            .field("prefix", &self.prefix())
+            .field("available_space", &(self.header.data_capacity as usize - self.header.space_used as usize))
             .finish()
     }
 }
