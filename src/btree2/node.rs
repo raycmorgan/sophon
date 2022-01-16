@@ -757,6 +757,11 @@ impl Node {
     }
 
     #[inline]
+    pub (crate) fn pid(&self) -> u64 {
+        self.header.pid
+    }
+
+    #[inline]
     fn copy_key<'b>(&self, slot: Slot, dst: &'b mut [u8]) -> &'b [u8] {
         use std::io::{Write, Cursor};
 

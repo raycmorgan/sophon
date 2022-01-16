@@ -6,7 +6,6 @@ mod page_guard;
 pub(crate) use page_guard::{PageGuard, LatchStrategy};
 pub(crate) const PAGE_SIZE: usize = 1024 * 16;
 pub(crate) const PAGE_DATA_RESERVED: usize = size_of::<u64>();
-// pub(crate) const USABLE_PAGE_SIZE: usize = PAGE_SIZE - size_of::<u64>();
 
 struct Header {
     version: AtomicU64,

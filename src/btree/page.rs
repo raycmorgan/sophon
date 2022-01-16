@@ -212,7 +212,6 @@ impl<'a> Page<'a> {
         // 2. Insert 4 byte key in header, offset of tail pos
         // 2. Incr key count
         // 4. Insert at tail pos: suffix
-        eprintln!("data len: {}", self.data.len());
         let prefix = read_u8_len_bytes(&self.data[HPOS_PREFIX]);
         if &key[..prefix.len()] != prefix {
             return Err(InsertPageError::IncorrectPrefix);

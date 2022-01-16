@@ -1,23 +1,20 @@
-use crate::{DiskManager, DiskManagerAllocError, buffer_manager::swip::Swip};
+use crate::buffer_manager::swip::Swip;
 use std::{fmt, mem::size_of};
-use std::sync::Arc;
 use std::cell::UnsafeCell;
-use log::debug;
 use madvise::AdviseMemory;
 use memmap::MmapMut;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED};
+use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED, PAGE_SIZE};
 
 pub(crate) mod swip;
 pub(crate) mod buffer_frame;
 
 pub(crate) struct BufferManager {
-    disk_manager: Box<dyn DiskManager>,
     base_page_size: usize,
     max_memory: usize,
     page_classes: Vec<PageClass>,
-    version_boundary: AtomicU64,
+    page_counter: AtomicUsize,
     frames: UnsafeCell<MmapMut>,
 }
 
@@ -28,19 +25,14 @@ pub(crate) trait Swipable {
     fn set_backing_len(&mut self, len: usize);
 }
 
-impl fmt::Debug for BufferManager {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("PageClass")
-           .field("base_page_size", &self.base_page_size)
-           .field("max_memory", &self.max_memory)
-           .field("page_classes", &self.page_classes)
-           .finish()
-    }
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum AllocError {
+    OutOfSpace
 }
 
 impl BufferManager {
-    pub fn new(disk_manager: Box<dyn DiskManager>, max_memory: usize) -> Self {
-        let base_page_size = disk_manager.base_page_size();
+    pub fn new(max_memory: usize) -> Self {
+        let base_page_size = PAGE_SIZE;
         let mut page_classes = Vec::new();
 
         let mut class_size = base_page_size;
@@ -58,34 +50,42 @@ impl BufferManager {
         // once it is init'ed, which ensures optimistic latches never see an
         // invalid page.
         let max_frames =  max_memory / base_page_size;
-        let frames = UnsafeCell::new(MmapMut::map_anon(max_frames).unwrap());
+        let frames = MmapMut::map_anon(max_frames * size_of::<BufferFrame>()).unwrap();
+
+        // println!("page_class -- mmap: {:p}", mmap.as_ref());
+        // unsafe { println!("frames: {:p}", frames.as_ref()); }
 
         Self {
-            disk_manager,
             base_page_size,
             max_memory,
             page_classes,
-            version_boundary: AtomicU64::new(0),
-            frames,
+            page_counter: AtomicUsize::new(0),
+            frames: UnsafeCell::new(frames),
+            // frames
         }
     }
 
-    pub fn new_page<T: Swipable>(&self) -> Result<Swip<T>, DiskManagerAllocError> {
-        let page_id = self.disk_manager.allocate_page(0)?;
+    pub fn new_page<T: Swipable>(&self) -> Result<Swip<T>, AllocError> {
+        // Simple bump allocation of pages
+        // TODO: implement reuse after free
+        let page_id = self.page_counter.fetch_add(1, Ordering::SeqCst);
+
         let page: &mut buffer_frame::Page = unsafe {
             std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr())
         };
 
         // TODO: assert within range
         let bf = unsafe {
-            self.frames
-                .get()
+            let bf = self.frames
+                .get().as_mut().unwrap()
+                .as_mut_ptr()
                 .offset((page_id * size_of::<BufferFrame>()) as isize)
-                as *mut BufferFrame
-        };
+                as *mut BufferFrame;
 
-        // let bf = Box::new(BufferFrame::new(page));
-        unsafe { BufferFrame::init(bf, page); }
+            BufferFrame::init(bf, page);
+            bf
+        };
+        
         let swip = Swip::new(bf as usize);
 
         let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
@@ -93,22 +93,10 @@ impl BufferManager {
         std::mem::drop(guard);
 
         Ok(swip)
-
-        // Ok((unswizzle.into(), self.page_classes[0].get_page(unswizzle.page_id())))
     }
 
     pub fn free_page() {}
     pub fn flush_pages() {}
-
-    /// Safety: This function will take anything that looks like a swizzled
-    /// pointer and convert that into a Page. Caller needs to be certain that
-    /// the referenced pointer is in fact pointing to one of the mmap'ed
-    /// segements created by PageClass.
-    // pub unsafe fn load_swizzled(&self, swizzle: Swizzle) -> &mut [u8] {
-    //     unimplemented!();
-    //     let page_class = &self.page_classes[swizzle.size_class()];
-    //     page_class.get_page(swizzle.page_id())
-    // }
 
     pub async fn load_unswizzled(&self, unswizzle: usize) -> &mut [u8] {
         // TODO: This function will look at the cooling stage and either reheat
@@ -117,20 +105,22 @@ impl BufferManager {
         // async operation.
         unimplemented!()
     }
+}
 
-    pub(crate) fn version_boundary(&self) -> u64 {
-        self.version_boundary.load(Ordering::Acquire)
+impl fmt::Debug for BufferManager {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("PageClass")
+           .field("base_page_size", &self.base_page_size)
+           .field("max_memory", &self.max_memory)
+           .field("page_classes", &self.page_classes)
+           .finish()
     }
-
-    // TODO: Ensure when unswizzling a page, we bump version_boundary
 }
 
 struct PageClass {
     page_size: usize,
     capacity: usize,
     mmap: UnsafeCell<MmapMut>,
-
-    // marker: std::marker::PhantomData<&'a ()>,
 }
 
 unsafe impl Sync for PageClass {}
@@ -147,19 +137,17 @@ impl fmt::Debug for PageClass {
 
 impl PageClass {
     fn new(page_size: usize, capacity: usize) -> Self {
+        assert!(capacity > 0, "capacity must be divisible by 4096");
         assert!(capacity % 4096 == 0, "capacity must be divisible by 4096");
-        let mmap = UnsafeCell::new(MmapMut::map_anon(capacity).unwrap());
+        let mmap = MmapMut::map_anon(capacity).unwrap();
+
+        // println!("page_class -- mmap: {:p}", mmap.as_ref());
 
         Self {
             page_size,
             capacity,
-            mmap,
-            // marker: Default::default()
+            mmap: UnsafeCell::new(mmap),
         }
-    }
-
-    fn mmap_start_as_usize(&self) -> usize {
-        self.mmap.get() as usize
     }
 
     /// Safety: This function will happily hand out multiple instances of the
@@ -167,8 +155,6 @@ impl PageClass {
     /// any potential data races.
     unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
-        // println!("get_page=> page_size: {}, pid: {}", self.page_size, page_id);
-
         let mmap = self.mmap.get().as_mut().unwrap();
         &mut mmap[start..start+self.page_size]
     }
@@ -186,42 +172,3 @@ impl PageClass {
             .unwrap();
     }
 }
-
-// pub struct Page<'a> {
-//     /// Safety: This data is backed by an aliased mutable buffer. It must be
-//     /// all accesses to this data must be done in a thread safe manner. At
-//     /// any point, another thread may also reset the buffer to zero bytes.
-//     /// See: `PageClass.get_page`.
-//     data: &'a mut [u8],
-// }
-
-// impl<'a> Page<'a> {
-//     /// Safety: This method assumes only one reference to the underlying data
-//     /// when called. Given this cannot be guaranteed at this layer, caller is
-//     /// responsible for upholding that guarantee.
-//     unsafe fn bootstrap(&mut self, unswizzle: Unswizzle, page_size: usize, base_page_size: usize) {
-//         use std::io::Write;
-//         (&mut self.data[0..8]).write(&(unswizzle.as_u64()).to_le_bytes()).expect("Memory write should always succeed");
-//     }
-
-//     fn get_swizzle(&self) -> Swizzle {
-//         Swizzle((u64::from_le_bytes(self.data[0..8].try_into().unwrap()) | 1) as usize)
-//     }
-// }
-
-
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tests::FakeDiskManager;
-
-    #[test]
-    fn it_works() {
-        let dm = FakeDiskManager::boxed();
-        let _bm = BufferManager::new(dm, 4096 * 4096);
-        // eprintln!("{:?}", bm);
-    }
-}
-

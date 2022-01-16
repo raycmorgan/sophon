@@ -1,5 +1,5 @@
 use std::alloc::{Allocator, Global};
-use std::ops::Range;
+use std::ops::{Range, Deref};
 use std::{mem::size_of, fmt::Debug};
 use std::sync::Arc;
 
@@ -269,8 +269,6 @@ impl<'a> BTree<'a> {
                 if let Some(parent) = parent {
                     debug_assert!(parent.contains(&node), "Parent: {:?}\n  Node: {:?}", parent, node);
                 }
-
-                debug!("pid: {}, is_leaf: {}", node.pid(), node.is_leaf());
                 
                 if node.is_leaf() {
                     // TODO: If we tracked height, we could perform this Shared latch without the spin above
@@ -373,17 +371,16 @@ impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
 
 #[cfg(test)]
 mod tests {
-    use std::{time::Instant, thread};
-
-    use crate::tests::FakeDiskManager;
-
+    use std::time::Instant;
     use super::*;
+
+    fn make_buffer_manager() -> BufferManager {
+        BufferManager::new(4096 * 4096 * 5000)
+    }
 
     #[test]
     fn insert_get() {
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 128);
-
+        let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
         btree.insert(b"foo", b"bar").unwrap();
         assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo").unwrap());
@@ -391,8 +388,7 @@ mod tests {
 
     #[test]
     fn basic_range_query() {
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 128);
+        let bm = make_buffer_manager();
 
         let btree = BTree::new(&bm);
         btree.insert(b"aaa", b"aaa").unwrap();
@@ -415,12 +411,10 @@ mod tests {
         }
     }
 
-    #[test]
+    // #[test]
     fn node_split_big_values() {
         let _ = env_logger::builder().is_test(true).try_init();
-
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 128);
+        let bm = make_buffer_manager();
 
         let btree = BTree::new(&bm);
         btree.insert(b"foo", &[1u8; 1028 * 10]).unwrap();
@@ -439,8 +433,7 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 4096 * 4);
+        let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
 
         let mut hashmap = HashMap::new();
@@ -465,8 +458,7 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 4096 * 100);
+        let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
 
         let count = 10000000;
@@ -539,8 +531,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         // let mut threads = vec![];
-        let dm = FakeDiskManager::boxed();
-        let bm = BufferManager::new(dm, 4096 * 4096 * 5000);
+        let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
 
         let count = 10000000;

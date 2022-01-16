@@ -138,9 +138,11 @@ impl<T: Swipable> PageGuard<T> {
     pub(crate) fn data_structure_mut(&self) -> &mut T {
         assert_eq!(LockState::Exclusive, self.state, "data_structure_mut requires exclusive lock");
 
-        let frame = unsafe { self.swip.as_buffer_frame_mut() };
-        let ptr = frame.page.data.as_mut_ptr();
-        unsafe { std::mem::transmute(ptr.as_mut().unwrap()) }
+        unsafe {
+            let frame = self.swip.as_buffer_frame_mut();
+            let ptr = frame.page.data.as_mut_ptr();
+            std::mem::transmute(ptr.as_mut().unwrap())
+        }
     }
 
     pub(crate) fn set_backing_len(&mut self, len: usize) {
