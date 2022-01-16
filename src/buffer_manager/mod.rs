@@ -13,7 +13,7 @@ pub(crate) mod swip;
 pub(crate) mod buffer_frame;
 
 pub(crate) struct BufferManager {
-    disk_manager: Arc<dyn DiskManager>,
+    disk_manager: Box<dyn DiskManager>,
     base_page_size: usize,
     max_memory: usize,
     page_classes: Vec<PageClass>,
@@ -39,7 +39,7 @@ impl fmt::Debug for BufferManager {
 }
 
 impl BufferManager {
-    pub fn new(disk_manager: Arc<dyn DiskManager>, max_memory: usize) -> Self {
+    pub fn new(disk_manager: Box<dyn DiskManager>, max_memory: usize) -> Self {
         let base_page_size = disk_manager.base_page_size();
         let mut page_classes = Vec::new();
 
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let dm = Arc::new(FakeDiskManager::default());
+        let dm = FakeDiskManager::boxed();
         let _bm = BufferManager::new(dm, 4096 * 4096);
         // eprintln!("{:?}", bm);
     }

@@ -158,6 +158,12 @@ mod tests {
         next_page: AtomicUsize,
     }
 
+    impl FakeDiskManager {
+        pub fn boxed() -> Box<Self> {
+            Box::new(FakeDiskManager::default())
+        }
+    }
+
     impl DiskManager for FakeDiskManager {
         fn capacity(&self) -> usize { 4096 * 1000 }
         fn base_page_size(&self) -> usize { crate::buffer_manager::buffer_frame::PAGE_SIZE }

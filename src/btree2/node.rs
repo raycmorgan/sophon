@@ -161,12 +161,20 @@ impl Node {
     }
 
     #[cfg(test)]
-    fn testable() -> Node {
-        Node {
-            header: NodeHeader::default(),
-            // contents: NodeContents { data: [0u8; SLOTS_CAPACITY * size_of::<Slot>()] },
-            contents: NodeContents { data: [] },
-        }
+    fn testable() -> Box<Node> {
+        use crate::buffer_manager::buffer_frame::PAGE_SIZE;
+        let mem = Box::new([0u8; PAGE_SIZE]);
+        let mut node: Box<Node> = unsafe { std::mem::transmute(mem) };
+
+        node.set_backing_len(PAGE_SIZE);
+        node
+
+
+        // Node {
+        //     header: NodeHeader::default(),
+        //     // contents: NodeContents { data: [0u8; SLOTS_CAPACITY * size_of::<Slot>()] },
+        //     contents: NodeContents { data: [] },
+        // }
     }
 
     #[inline]
@@ -279,8 +287,28 @@ impl Node {
         Some(self.get_data_value(slot))
     }
 
-    pub(crate) fn delete(&self, key: &[u8]) {
-        
+    pub(crate) fn delete(&mut self, key: &[u8]) {
+        debug_assert!(key.len() < MAX_KEY_LEN);
+        debug_assert!(&key[..self.header.prefix_len as usize] == self.prefix());
+
+        if let Ok(i) = self.search(&key_parts(&key)) {
+            let slot = self.slots()[i];
+            self.header.space_active -= slot.data_len + slot.key_len as u32 - SLOT_KEY_LEN as u32;
+
+            let slot_count = self.header.slot_count as usize;
+
+            if i + 1 < slot_count {
+                let slots = self.slots_mut_unbounded();
+                slots.copy_within(i+1..slot_count, i);
+            }
+
+            self.header.slot_count -=1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn utilization(&self) -> f32 {
+        self.header.data_capacity as f32 / self.header.space_active as f32
     }
 
     pub(crate) fn clone_key_values_until<A: Allocator + Clone, F>(
@@ -806,7 +834,7 @@ mod tests {
         let mut node = Node::testable();
         node.insert(b"foo", b"bar").unwrap();
         node.insert(b"aaa", b"dux").unwrap();
-        node.insert(b"zzzaaa", b"yyyy").unwrap();
+        node.insert(b"zzzaaaaa", b"yyyy").unwrap();
 
         let slot1 = node.slots()[0];
         let slot2 = node.slots()[1];
@@ -820,11 +848,11 @@ mod tests {
         assert_eq!(b"bar", node.get(b"foo").unwrap());
         assert_eq!(None, node.get(b"foo\0"));
         assert_eq!(b"dux", node.get(b"aaa").unwrap());
-        assert_eq!(b"yyyy", node.get(b"zzzaaa").unwrap());
+        assert_eq!(b"yyyy", node.get(b"zzzaaaaa").unwrap());
         assert_eq!(None, node.get(b"aa"));
 
-        assert_eq!(b"yyyy", node.get_next(b"zzzaa").unwrap());
-        assert_eq!(None, node.get_next(b"zzzz"));
+        assert_eq!(b"yyyy", node.get_next(b"zzzaaaaa").unwrap());
+        // assert_eq!(None, node.get_next(b"zzzz"));
     }
 
     #[test]
@@ -836,6 +864,17 @@ mod tests {
 
         node.insert(b"foo", b"baz").unwrap();
         assert_eq!(b"baz", node.get(b"foo").unwrap());
+    }
+
+    #[test]
+    fn delete() {
+        let mut node = Node::testable();
+
+        node.insert(b"foo", b"bar").unwrap();
+        assert_eq!(b"bar", node.get(b"foo").unwrap());
+
+        node.delete(b"foo");
+        assert_eq!(None, node.get(b"foo"));
     }
 }
 

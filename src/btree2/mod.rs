@@ -34,18 +34,17 @@ pub(crate) enum SearchError {
 
 // The size of this stack limits the depth that a tree can become.
 // We need to statically hold this max depth, so that we can 
-type NodePath = StackVec<[(Swip<Node>, u64); 32]>;
-type LockPath = StackVec<[PageGuard<Node>; 32]>;
+type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 
 
 #[derive(Clone)]
-struct BTree {
-    buffer_manager: Arc<BufferManager>,
+struct BTree<'a> {
+    buffer_manager: &'a BufferManager,
     root_page: Swip<Node>,
 }
 
-impl BTree {
-    pub fn new(buffer_manager: Arc<BufferManager>) -> Self {
+impl<'a> BTree<'a> {
+    pub fn new(buffer_manager: &'a BufferManager) -> Self {
         let root_swip: Swip<Node> = buffer_manager.new_page().unwrap();
         let mut node = root_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
         node.init_header(
@@ -59,7 +58,7 @@ impl BTree {
         );
 
         BTree {
-            buffer_manager,
+            buffer_manager: buffer_manager,
             root_page: root_swip,
         }
     }
@@ -253,11 +252,11 @@ impl BTree {
 
     /// Returned PageGuard are returned locked via `strategy`
     /// Returned PageGuards in LockPath are Optimistic
-    fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> Result<(PageGuard<Node>, LockPath), SearchError> {
+    fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> Result<(PageGuard<Node>, GuardPath), SearchError> {
         debug!("search_to_leaf: {:?}", key);
 
         'restart: loop {
-            let mut path: LockPath = Default::default();
+            let mut path: GuardPath = Default::default();
             let mut swip = self.root_page;
 
             loop {
@@ -310,19 +309,19 @@ impl BTree {
         }
     }
 
-    pub(crate) fn range<'a, F>(
-        &self, start: &[u8], end: Option<&'a [u8]>, pred: F
+    pub(crate) fn range<F>(
+        &'a self, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, Global, F>
     where F: Fn(&[u8]) -> bool + Clone {
         self.range_in(Global.clone(), start, end, pred)
     }
 
-    pub(crate) fn range_in<'a, F, A>(
-        &self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
+    pub(crate) fn range_in<F, A>(
+        &'a self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, A, F>
     where F: Fn(&[u8]) -> bool, A: Allocator + Clone {
         BTreeRange {
-            btree: self.clone(),
+            btree: &self,
             lower_fence: Some(start.to_vec()),
             upper_bound: end,
             pred,
@@ -334,7 +333,7 @@ impl BTree {
 struct BTreeRange<'a, A: Allocator + Clone, F>
     where F: Fn(&[u8]) -> bool
 {
-    btree: BTree,
+    btree: &'a BTree<'a>,
     lower_fence: Option<Vec<u8>>,
     upper_bound: Option<&'a [u8]>,
     alloc: A,
@@ -361,7 +360,11 @@ impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
             self.lower_fence = Some(node.upper_fence().to_vec());
         }
 
-        Some(node.clone_key_values_until(self.upper_bound, &self.pred, self.alloc.clone()))
+        Some(node.clone_key_values_until(
+            self.upper_bound.as_ref().map(|k| &k[..]),
+            &self.pred,
+            self.alloc.clone())
+        )
     }
 }
 
@@ -378,20 +381,20 @@ mod tests {
 
     #[test]
     fn insert_get() {
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 128));
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 128);
 
-        let btree = BTree::new(bm);
+        let btree = BTree::new(&bm);
         btree.insert(b"foo", b"bar").unwrap();
         assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo").unwrap());
     }
 
     #[test]
     fn basic_range_query() {
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 128));
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 128);
 
-        let btree = BTree::new(bm);
+        let btree = BTree::new(&bm);
         btree.insert(b"aaa", b"aaa").unwrap();
         btree.insert(b"bbb", b"bbb").unwrap();
         btree.insert(b"ccc", b"ccc").unwrap();
@@ -416,10 +419,10 @@ mod tests {
     fn node_split_big_values() {
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 128));
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 128);
 
-        let btree = BTree::new(bm);
+        let btree = BTree::new(&bm);
         btree.insert(b"foo", &[1u8; 1028 * 10]).unwrap();
         btree.insert(b"bar", &[2u8; 1028 * 10]).unwrap();
         btree.insert(b"mmm", &[3u8; 1028 * 10]).unwrap();
@@ -436,9 +439,9 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 4096 * 4));
-        let btree = BTree::new(bm);
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 4096 * 4);
+        let btree = BTree::new(&bm);
 
         let mut hashmap = HashMap::new();
 
@@ -462,9 +465,9 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 4096 * 100));
-        let btree = BTree::new(bm);
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 4096 * 100);
+        let btree = BTree::new(&bm);
 
         let count = 10000000;
 
@@ -532,14 +535,13 @@ mod tests {
     #[test]
     fn threaded_split_many_multi_level() {
         use rand::Rng;
-        use std::collections::HashMap;
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let mut threads = vec![];
-        let dm = Arc::new(FakeDiskManager::default());
-        let bm = Arc::new(BufferManager::new(dm, 4096 * 4096 * 5000));
-        let btree = BTree::new(bm);
+        // let mut threads = vec![];
+        let dm = FakeDiskManager::boxed();
+        let bm = BufferManager::new(dm, 4096 * 4096 * 5000);
+        let btree = BTree::new(&bm);
 
         let count = 10000000;
         let thread_count = 4;
@@ -564,27 +566,25 @@ mod tests {
 
         let start = Instant::now();
 
-        for i in 0..thread_count {
-            let vec = kv_buckets[i].clone();
-            let inner_btree = btree.clone();
-            let handle = thread::spawn(move || {
-                let btree = inner_btree;
+        crossbeam::thread::scope(|s| {
 
-                for (k, v) in vec.into_iter() {
-                    btree.insert(&k, &v).unwrap();
-                }
-                
-                // for (_i, (k, v)) in hashmap.iter().enumerate() {
-                //     assert_eq!(Some(v.to_vec()), btree.get(&k[..]).unwrap());
-                // }
-            });
+            for i in 0..thread_count {
+                let vec = kv_buckets[i].clone();
+                let inner_btree = btree.clone();
+                s.spawn(move |_| {
+                    let btree = inner_btree;
 
-            threads.push(handle);
-        }
+                    for (k, v) in vec.into_iter() {
+                        btree.insert(&k, &v).unwrap();
+                    }
+                    
+                    // for (_i, (k, v)) in hashmap.iter().enumerate() {
+                    //     assert_eq!(Some(v.to_vec()), btree.get(&k[..]).unwrap());
+                    // }
+                });
+            }
 
-        for t in threads.into_iter() {
-            t.join().unwrap();
-        }
+        }).unwrap();
 
         let elapsed = start.elapsed().as_nanos();
 
@@ -595,34 +595,31 @@ mod tests {
         use rand::distributions::{Distribution, Uniform};
         
         let kvs = Arc::new(all_key_values);
-        let mut threads = vec![];
+        // let mut threads = vec![];
         let thread_count = thread_count * 2;
 
         let start = Instant::now();
+        
+        crossbeam::thread::scope(|s| {
 
-        for _ in 0..thread_count {
-            let inner_kvs = kvs.clone();
-            let inner_btree = btree.clone();
+            for _ in 0..thread_count {
+                let inner_kvs = kvs.clone();
+                let inner_btree = btree.clone();
 
-            let handle = thread::spawn(move || {
-                let kvs = inner_kvs;
-                let btree = inner_btree;
+                s.spawn(move |_| {
+                    let kvs = inner_kvs;
+                    let btree = inner_btree;
 
-                let mut rng = rand::thread_rng();
-                let die = Uniform::from(0..kvs.len());
+                    let mut rng = rand::thread_rng();
+                    let die = Uniform::from(0..kvs.len());
 
-                for _ in 0..count {
-                    let idx = die.sample(&mut rng);
-                    btree.get(&kvs[idx].0).unwrap();
-                }
-            });
-
-            threads.push(handle);
-        }
-
-        for t in threads.into_iter() {
-            t.join().unwrap();
-        }
+                    for _ in 0..count {
+                        let idx = die.sample(&mut rng);
+                        btree.get(&kvs[idx].0).unwrap();
+                    }
+                });
+            }
+        }).unwrap();
 
         let elapsed = start.elapsed().as_nanos();
 
