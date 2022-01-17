@@ -5,7 +5,11 @@ use log::debug;
 use stackvec::StackVec;
 
 use crate::buffer_manager::swip::OptimisticError;
-use crate::buffer_manager::{BufferManager, swip::Swip, buffer_frame::{PageGuard, LatchStrategy}};
+use crate::buffer_manager::{
+    buffer_frame::{LatchStrategy, PageGuard},
+    swip::Swip,
+    BufferManager,
+};
 
 use self::node::Node;
 
@@ -24,10 +28,9 @@ mod node;
 // ~500PB of leaf data. This would save stack space.
 type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 
-
 /// `BTree` is a core data structure. It presents a concurrent, thread safe, ordered
 /// map backed by a provided `BufferManager`.
-/// 
+///
 /// `BTree` goes out of its way to not perform heap allocations and to minimize copying
 /// data (outside of actually copying bytes into the `BTree`'s pages) in order to
 /// maximize performance.
@@ -45,12 +48,15 @@ impl<'a> BTree<'a> {
     /// Create a new `BTree` using the backing `BufferManager`. This will immediately
     /// ask the `BufferManager` for an initial page, which will be treated as the root
     /// page for this `BTree`.
-    /// 
+    ///
     /// Many `BTree`s can share the same `BufferManager`. For instance, you may want different
     /// `BTree`s for different indexes or tables in a SQL database.
     pub fn new(buffer_manager: &'a BufferManager) -> Self {
         let root_swip: Swip<Node> = buffer_manager.new_page().unwrap();
-        let mut node = root_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
+        let mut node = root_swip
+            .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+            .expect("infallible");
+
         node.init_header(
             1,
             root_swip.page_id(),
@@ -69,7 +75,7 @@ impl<'a> BTree<'a> {
 
     /// Insert a key-value pair into the `BTree`. On conflict, this will replace
     /// the current value in.
-    /// 
+    ///
     /// Potential costs:
     /// 1. It may compact nodes to fit the key-value pair
     /// 2. It may split nodes to fit the key-value pair
@@ -78,7 +84,8 @@ impl<'a> BTree<'a> {
         'outer: loop {
             let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
 
-            #[cfg(debug_assertions)] {
+            #[cfg(debug_assertions)]
+            {
                 if !node.shares_prefix(key) {
                     let children = path.last().unwrap().all_children();
 
@@ -91,18 +98,27 @@ impl<'a> BTree<'a> {
                         }
                     });
 
-                    panic!("Key: {:?}\n\nNode: {:?}\n\nPath: {:?}", 
-                        key, node, path);
+                    panic!("Key: {:?}\n\nNode: {:?}\n\nPath: {:?}", key, node, path);
                 }
 
                 path.windows(2).for_each(|w| {
                     let parent = &w[0];
                     let child = &w[1];
-                    debug_assert!(parent.contains(&child), "Parent: {:?}\n  Child: {:?}", parent, child);
+                    debug_assert!(
+                        parent.contains(&child),
+                        "Parent: {:?}\n  Child: {:?}",
+                        parent,
+                        child
+                    );
                 });
 
                 if let Some(parent) = path.last() {
-                    debug_assert!(parent.contains(&node), "Parent: {:?}\n  Child: {:?}", parent, node);
+                    debug_assert!(
+                        parent.contains(&node),
+                        "Parent: {:?}\n  Child: {:?}",
+                        parent,
+                        node
+                    );
                 }
             }
 
@@ -117,8 +133,12 @@ impl<'a> BTree<'a> {
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                 let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
 
-                let mut right = right_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
-                let mut left = left_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
+                let mut right = right_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
+                let mut left = left_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
 
                 // let pivot_key = node.pivot_key_for_split(&key, value.len(), &mut temp);
                 let (pivot, _, _) = node.pivot_for_split();
@@ -170,12 +190,18 @@ impl<'a> BTree<'a> {
                     let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                     let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
 
-                    let mut right = right_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
-                    let mut left = left_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
+                    let mut right = right_swip
+                        .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                        .expect("infallible");
+                    let mut left = left_swip
+                        .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                        .expect("infallible");
 
                     parent.root_split(&mut left, &mut right, pivot);
 
-                    let s = node.get_next(&key).expect("All inner nodes should return _something_");
+                    let s = node
+                        .get_next(&key)
+                        .expect("All inner nodes should return _something_");
 
                     let n = if s == left.swip_bytes() {
                         right.downgrade();
@@ -198,7 +224,7 @@ impl<'a> BTree<'a> {
 
             let mut right_guard = None;
 
-            for i in path_len-parents..path_len {
+            for i in path_len - parents..path_len {
                 let parts = path.split_at_mut(i + 1);
                 let parent = parts.0.last().expect("infallible");
                 let left = parts.1.first().unwrap_or(&node);
@@ -213,22 +239,34 @@ impl<'a> BTree<'a> {
 
                 // TODO(safety): handle error
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
-                let mut right = right_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
+                let mut right = right_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
 
                 left.split(&mut right, pivot);
 
                 debug_assert!(parent.shares_prefix(right.lower_fence()));
-                debug_assert!(parent.contains(&right), "Parent: {:?}\n  Left: {:?}\n  Right: {:?}",
-                    parent, left, right);
+                debug_assert!(
+                    parent.contains(&right),
+                    "Parent: {:?}\n  Left: {:?}\n  Right: {:?}",
+                    parent,
+                    left,
+                    right
+                );
 
                 match parent.insert_inner(&right) {
                     Ok(()) => (),
-                    Err(e) => panic!("Error: {:?} trying to insert {}\n{:?}", e, klen+vlen, parent),
+                    Err(e) => panic!(
+                        "Error: {:?} trying to insert {}\n{:?}",
+                        e,
+                        klen + vlen,
+                        parent
+                    ),
                 };
                 parent.downgrade();
 
                 if !left.is_leaf() && key >= left.upper_fence() {
-                    path[i+1] = right;
+                    path[i + 1] = right;
                 } else {
                     right_guard = Some(right);
                 }
@@ -250,14 +288,14 @@ impl<'a> BTree<'a> {
 
     /// Looks up a value that matches the provided key in the `BTree`,
     /// returning a copy of the value if found, else returns `None`.
-    /// 
+    ///
     /// Cost: Performs a single heap allocation to copy the data from the
     /// backing page data to return a safe copy.
-    /// 
+    ///
     /// TODO: implement Alloc variant `get_in`
     pub fn get(&self, key: &[u8]) -> Option<Box<[u8]>> {
         let (node, _) = self.search_to_leaf(&key, LatchStrategy::Shared);
-        node.get(key).map(|v| v.to_vec().into_boxed_slice() )
+        node.get(key).map(|v| v.to_vec().into_boxed_slice())
     }
 
     /// Returned PageGuard is returned locked via `strategy`
@@ -277,9 +315,14 @@ impl<'a> BTree<'a> {
                 };
 
                 if let Some(parent) = parent {
-                    debug_assert!(parent.contains(&node), "Parent: {:?}\n  Node: {:?}", parent, node);
+                    debug_assert!(
+                        parent.contains(&node),
+                        "Parent: {:?}\n  Node: {:?}",
+                        parent,
+                        node
+                    );
                 }
-                
+
                 if node.is_leaf() {
                     // TODO: If we tracked height, we could perform this Shared latch without the spin above
                     let node = match swip.coupled_page_guard(parent, strategy) {
@@ -289,7 +332,9 @@ impl<'a> BTree<'a> {
 
                     return (node, path);
                 } else {
-                    let s = node.get_next(&key).expect("All inner nodes should return _something_");
+                    let s = node
+                        .get_next(&key)
+                        .expect("All inner nodes should return _something_");
                     let ptr = usize::from_ne_bytes(s.try_into().expect("8 byte response"));
 
                     let child: Swip<Node> = Swip::new(ptr);
@@ -321,35 +366,47 @@ impl<'a> BTree<'a> {
 
     /// Creates an iterator over some range of the `BTree` returning chunks of
     /// key-value pairs each iteration.
-    /// 
+    ///
     /// To limit the amount of returned data (and cloning of said data), caller
     /// can provide a predicate function to filter out results prior to cloning
     /// the data.
-    /// 
+    ///
     /// Cost: Heap allocates (into the Global allocator), key-value pairs a
     /// page at a time. Key-value pairs filtered out via the provided predicate
     /// are not cloned.
     /// Leaf pages are reader locked while performing predicate scan and
     /// key-value cloning.
-    /// 
+    ///
     /// TODO: Should we provide an interface that allows iterating without any
     /// heap allocation by holding the lock during the duration of the caller?
     pub fn range<F>(
-        &'a self, start: &[u8], end: Option<&'a [u8]>, pred: F
+        &'a self,
+        start: &[u8],
+        end: Option<&'a [u8]>,
+        pred: F,
     ) -> BTreeRange<'a, Global, F>
-    where F: Fn(&[u8]) -> bool + Clone {
+    where
+        F: Fn(&[u8]) -> bool + Clone,
+    {
         self.range_in(Global.clone(), start, end, pred)
     }
 
     /// See `range`.
-    /// 
+    ///
     /// Variant of `range` in which allocation happens on the provided `Alloc`.
     /// This is useful for the caller to manage alloc/dealloc costs by doing
     /// things like utilizing a simple Arena allocator in whihc
     pub fn range_in<F, A>(
-        &'a self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
+        &'a self,
+        alloc: A,
+        start: &[u8],
+        end: Option<&'a [u8]>,
+        pred: F,
     ) -> BTreeRange<'a, A, F>
-    where F: Fn(&[u8]) -> bool, A: Allocator + Clone {
+    where
+        F: Fn(&[u8]) -> bool,
+        A: Allocator + Clone,
+    {
         BTreeRange {
             btree: &self,
             lower_fence: Some(start.to_vec()),
@@ -361,7 +418,8 @@ impl<'a> BTree<'a> {
 }
 
 pub struct BTreeRange<'a, A: Allocator + Clone, F>
-    where F: Fn(&[u8]) -> bool
+where
+    F: Fn(&[u8]) -> bool,
 {
     btree: &'a BTree<'a>,
     lower_fence: Option<Vec<u8>>,
@@ -371,7 +429,8 @@ pub struct BTreeRange<'a, A: Allocator + Clone, F>
 }
 
 impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
-    where F: Fn(&[u8]) -> bool
+where
+    F: Fn(&[u8]) -> bool,
 {
     type Item = Vec<(Box<[u8], A>, Box<[u8], A>)>;
 
@@ -393,18 +452,15 @@ impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
         Some(node.clone_key_values_until(
             self.upper_bound.as_ref().map(|k| &k[..]),
             &self.pred,
-            self.alloc.clone())
-        )
+            self.alloc.clone(),
+        ))
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
     use super::*;
+    use std::time::Instant;
 
     fn make_buffer_manager() -> BufferManager {
         BufferManager::new(4096 * 4096 * 5000)
@@ -477,9 +533,14 @@ mod tests {
             btree.insert(&key, &value);
             hashmap.insert(key, value);
         }
-        
+
         for (i, (k, v)) in hashmap.iter().enumerate() {
-            assert_eq!(Some(v.to_vec().into_boxed_slice()), btree.get(&k[..]), "Failed on check {}", i);
+            assert_eq!(
+                Some(v.to_vec().into_boxed_slice()),
+                btree.get(&k[..]),
+                "Failed on check {}",
+                i
+            );
         }
     }
 
@@ -508,7 +569,7 @@ mod tests {
         }
 
         let start = Instant::now();
-        
+
         for (k, v) in &vec {
             btree.insert(k, v);
         }
@@ -518,7 +579,7 @@ mod tests {
         println!("Insert completed in {}ms", elapsed / 1000000);
         println!("Ops/s: {}", 1000000000 / (elapsed / count as u128));
         println!("Checking results...");
-        
+
         for (i, (k, v)) in hashmap.iter().enumerate() {
             if Some(v.to_vec().into_boxed_slice()) != btree.get(&k[..]) {
                 let (node, path) = btree.search_to_leaf(k, LatchStrategy::OptimisticSpin);
@@ -531,13 +592,16 @@ mod tests {
                         let right = &w[1];
 
                         if left.upper_fence() != right.lower_fence() {
-                            println!("Fence mismatch:\nParent: {:?}\n    Left:   {:?}\n    Right:  {:?}", node, left, right);
+                            println!(
+                                "Fence mismatch:\nParent: {:?}\n    Left:   {:?}\n    Right:  {:?}",
+                                node, left, right
+                            );
                         }
                     });
 
                     for child in children.iter() {
                         if !child.is_leaf() {
-                            debug_fence_mismatch(child);    
+                            debug_fence_mismatch(child);
                         }
                     }
                 }
@@ -545,17 +609,12 @@ mod tests {
                 debug_fence_mismatch(path.first().unwrap());
 
                 panic!(
-                    "Failed on check {}\n\nKey: {:?}\n\nNode: {:?}\n\nPath: {:?}", 
-                    i, 
-                    k,
-                    node,
-                    path
+                    "Failed on check {}\n\nKey: {:?}\n\nNode: {:?}\n\nPath: {:?}",
+                    i, k, node, path
                 );
             }
         }
     }
-
-
 
     #[test]
     #[ignore]
@@ -593,7 +652,6 @@ mod tests {
         let start = Instant::now();
 
         crossbeam::thread::scope(|s| {
-
             for i in 0..thread_count {
                 let vec = kv_buckets[i].clone();
                 let inner_btree = btree.clone();
@@ -603,31 +661,33 @@ mod tests {
                     for (k, v) in vec.into_iter() {
                         btree.insert(&k, &v);
                     }
-                    
+
                     // for (_i, (k, v)) in hashmap.iter().enumerate() {
                     //     assert_eq!(Some(v.to_vec()), btree.get(&k[..]).unwrap());
                     // }
                 });
             }
-
-        }).unwrap();
+        })
+        .unwrap();
 
         let elapsed = start.elapsed().as_nanos();
 
         println!("Insert completed in {}ms", elapsed / 1000000);
-        println!("Ops/s: {}", 1000000000 / (elapsed / (count * thread_count) as u128));
+        println!(
+            "Ops/s: {}",
+            1000000000 / (elapsed / (count * thread_count) as u128)
+        );
 
         // all_key_values
         use rand::distributions::{Distribution, Uniform};
-        
+
         let kvs = Arc::new(all_key_values);
         // let mut threads = vec![];
         let thread_count = thread_count * 2;
 
         let start = Instant::now();
-        
-        crossbeam::thread::scope(|s| {
 
+        crossbeam::thread::scope(|s| {
             for _ in 0..thread_count {
                 let inner_kvs = kvs.clone();
                 let inner_btree = btree.clone();
@@ -645,11 +705,15 @@ mod tests {
                     }
                 });
             }
-        }).unwrap();
+        })
+        .unwrap();
 
         let elapsed = start.elapsed().as_nanos();
 
         println!("Read completed in {}ms", elapsed / 1000000);
-        println!("Ops/s: {}", 1000000000 / (elapsed / (count * thread_count) as u128));
+        println!(
+            "Ops/s: {}",
+            1000000000 / (elapsed / (count * thread_count) as u128)
+        );
     }
 }

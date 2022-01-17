@@ -1,10 +1,13 @@
+use super::{
+    buffer_frame::{LatchStrategy, PageGuard},
+    Swipable,
+};
+use crate::buffer_manager::buffer_frame::BufferFrame;
 use std::fmt::Debug;
-use crate::{buffer_manager::buffer_frame::BufferFrame};
-use super::{buffer_frame::{PageGuard, LatchStrategy}, Swipable};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum OptimisticError {
-    Conflict
+    Conflict,
 }
 
 pub(crate) struct Swip<T: Swipable> {
@@ -14,7 +17,10 @@ pub(crate) struct Swip<T: Swipable> {
 
 impl<T: Swipable> From<usize> for Swip<T> {
     fn from(ptr: usize) -> Self {
-        Swip { ptr, _marker: Default::default() }
+        Swip {
+            ptr,
+            _marker: Default::default(),
+        }
     }
 }
 
@@ -28,7 +34,7 @@ impl<T: Swipable> Clone for Swip<T> {
     fn clone(&self) -> Self {
         Swip {
             ptr: self.ptr,
-            _marker: self._marker
+            _marker: self._marker,
         }
     }
 }
@@ -37,9 +43,7 @@ impl<T: Swipable> Copy for Swip<T> {}
 
 impl<T: Swipable> Debug for Swip<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Swip")
-            .field("ptr", &self.ptr)
-            .finish()
+        f.debug_struct("Swip").field("ptr", &self.ptr).finish()
     }
 }
 
@@ -61,7 +65,7 @@ impl<T: Swipable> Swip<T> {
     pub(crate) fn value(&self) -> u64 {
         self.ptr as u64
     }
-    
+
     #[inline]
     pub(crate) fn value_bytes(&self) -> [u8; 8] {
         (self.ptr as u64).to_ne_bytes()
@@ -93,7 +97,11 @@ impl<T: Swipable> Swip<T> {
     }
 
     #[inline]
-    pub(crate) fn coupled_page_guard<T2: Swipable>(self, parent: Option<&PageGuard<T2>>, strategy: LatchStrategy) -> Result<PageGuard<T>, OptimisticError> {
+    pub(crate) fn coupled_page_guard<T2: Swipable>(
+        self,
+        parent: Option<&PageGuard<T2>>,
+        strategy: LatchStrategy,
+    ) -> Result<PageGuard<T>, OptimisticError> {
         let guard = match strategy {
             LatchStrategy::OptimisticSpin => PageGuard::new_optimistic_spin(self),
             LatchStrategy::OptimisticOrShared => PageGuard::new_optimistic_or_shared(self),

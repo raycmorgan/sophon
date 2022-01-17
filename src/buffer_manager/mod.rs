@@ -1,13 +1,13 @@
 use crate::buffer_manager::swip::Swip;
-use std::{fmt, mem::size_of};
-use std::cell::UnsafeCell;
 use memmap::MmapMut;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{fmt, mem::size_of};
 
 use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED, PAGE_SIZE};
 
-pub(crate) mod swip;
 pub(crate) mod buffer_frame;
+pub(crate) mod swip;
 
 pub struct BufferManager {
     base_page_size: usize,
@@ -26,7 +26,7 @@ pub(crate) trait Swipable {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum AllocError {
-    OutOfSpace
+    OutOfSpace,
 }
 
 impl BufferManager {
@@ -48,7 +48,7 @@ impl BufferManager {
         // the version of a Frame (even if the underlying page is unswizzled)
         // once it is init'ed, which ensures optimistic latches never see an
         // invalid page.
-        let max_frames =  max_memory / base_page_size;
+        let max_frames = max_memory / base_page_size;
         let frames = MmapMut::map_anon(max_frames * size_of::<BufferFrame>()).unwrap();
 
         // println!("page_class -- mmap: {:p}", mmap.as_ref());
@@ -69,14 +69,16 @@ impl BufferManager {
         // TODO: implement reuse after free
         let page_id = self.page_counter.fetch_add(1, Ordering::SeqCst);
 
-        let page: &mut buffer_frame::Page = unsafe {
-            std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr())
-        };
+        let page: &mut buffer_frame::Page =
+            unsafe { std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr()) };
 
         // TODO: assert within range
         let bf = unsafe {
-            let bf = self.frames
-                .get().as_mut().unwrap()
+            let bf = self
+                .frames
+                .get()
+                .as_mut()
+                .unwrap()
                 .as_mut_ptr()
                 .offset((page_id * size_of::<BufferFrame>()) as isize)
                 as *mut BufferFrame;
@@ -84,7 +86,7 @@ impl BufferManager {
             BufferFrame::init(bf, page);
             bf
         };
-        
+
         let swip = Swip::new(bf as usize);
 
         let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
@@ -109,10 +111,10 @@ impl BufferManager {
 impl fmt::Debug for BufferManager {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("PageClass")
-           .field("base_page_size", &self.base_page_size)
-           .field("max_memory", &self.max_memory)
-           .field("page_classes", &self.page_classes)
-           .finish()
+            .field("base_page_size", &self.base_page_size)
+            .field("max_memory", &self.max_memory)
+            .field("page_classes", &self.page_classes)
+            .finish()
     }
 }
 
@@ -127,10 +129,10 @@ unsafe impl Sync for PageClass {}
 impl fmt::Debug for PageClass {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("PageClass")
-           .field("page_size", &self.page_size)
-           .field("capacity", &self.capacity)
-           .field("mmap", &format!("[mmap@{}]", self.mmap.get() as usize))
-           .finish()
+            .field("page_size", &self.page_size)
+            .field("capacity", &self.capacity)
+            .field("mmap", &format!("[mmap@{}]", self.mmap.get() as usize))
+            .finish()
     }
 }
 
@@ -155,7 +157,7 @@ impl PageClass {
     unsafe fn get_page(&self, page_id: usize) -> &mut [u8] {
         let start = page_id * self.page_size;
         let mmap = self.mmap.get().as_mut().unwrap();
-        &mut mmap[start..start+self.page_size]
+        &mut mmap[start..start + self.page_size]
     }
 
     // /// Safety: Calling this will clear out the data underlying the page. It

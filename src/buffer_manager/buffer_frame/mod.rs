@@ -1,9 +1,15 @@
-use std::{mem::size_of, sync::atomic::{AtomicU64, Ordering}};
-use parking_lot::{RawRwLock as RwLock, lock_api::{RawRwLock, RawRwLockUpgrade}};
+use parking_lot::{
+    lock_api::{RawRwLock, RawRwLockUpgrade},
+    RawRwLock as RwLock,
+};
+use std::{
+    mem::size_of,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 mod page_guard;
 
-pub(crate) use page_guard::{PageGuard, LatchStrategy};
+pub(crate) use page_guard::{LatchStrategy, PageGuard};
 pub(crate) const PAGE_SIZE: usize = 1024 * 16;
 pub(crate) const PAGE_DATA_RESERVED: usize = size_of::<u64>();
 
@@ -76,7 +82,7 @@ pub(crate) struct Page {
     gsn: u64,
     // Placeholder -- real len in noted self contained inside data,
     // it is at least large enough to know its own length
-    data: [u8; 0] // [u8; USABLE_PAGE_SIZE],
+    data: [u8; 0], // [u8; USABLE_PAGE_SIZE],
 }
 
 #[cfg(test)]
@@ -95,7 +101,9 @@ mod tests {
         bf.latch_exclusive();
         assert_ne!(preversion, bf.version());
         assert!(bf.header.latch.is_locked());
-        unsafe { bf.unlatch_exclusive(); }
+        unsafe {
+            bf.unlatch_exclusive();
+        }
         assert_eq!(false, bf.header.latch.is_locked());
         assert!(preversion < bf.version());
     }

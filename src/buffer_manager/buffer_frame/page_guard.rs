@@ -1,14 +1,14 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 
-use crate::buffer_manager::Swipable;
 use crate::buffer_manager::swip::Swip;
+use crate::buffer_manager::Swipable;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum LockState {
     Optimistic,
     Shared,
-    Exclusive
+    Exclusive,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -42,7 +42,7 @@ impl<T: Swipable> PageGuard<T> {
                 break;
             }
         }
-        
+
         PageGuard {
             swip,
             initial_version,
@@ -136,7 +136,11 @@ impl<T: Swipable> PageGuard<T> {
 
     #[inline]
     pub(crate) fn data_structure_mut(&self) -> &mut T {
-        assert_eq!(LockState::Exclusive, self.state, "data_structure_mut requires exclusive lock");
+        assert_eq!(
+            LockState::Exclusive,
+            self.state,
+            "data_structure_mut requires exclusive lock"
+        );
 
         unsafe {
             let frame = self.swip.as_buffer_frame_mut();
@@ -200,10 +204,9 @@ impl<T: Swipable> PageGuard<T> {
 
         match self.state {
             LockState::Exclusive => return,
-            LockState::Shared => {
-                unsafe { frame.upgrade_latch(); }
-                
-            }
+            LockState::Shared => unsafe {
+                frame.upgrade_latch();
+            },
 
             LockState::Optimistic => {
                 frame.latch_exclusive();
@@ -217,14 +220,11 @@ impl<T: Swipable> PageGuard<T> {
         let frame = unsafe { self.swip.as_buffer_frame() };
 
         match self.state {
-            LockState::Exclusive => {
-                unsafe { frame.unlatch_exclusive() }
-            },
+            LockState::Exclusive => unsafe { frame.unlatch_exclusive() },
 
-            LockState::Shared => {
-                unsafe { frame.unlatch_shared(); }
-                
-            }
+            LockState::Shared => unsafe {
+                frame.unlatch_shared();
+            },
 
             LockState::Optimistic => return (),
         }
@@ -243,7 +243,7 @@ impl<T: Swipable> Drop for PageGuard<T> {
             match self.state {
                 LockState::Exclusive => frame.unlatch_exclusive(),
                 LockState::Shared => frame.unlatch_shared(),
-                _ => ()
+                _ => (),
             }
         }
     }
@@ -257,7 +257,7 @@ impl<T: Swipable> Deref for PageGuard<T> {
     }
 }
 
-impl<T: Swipable> DerefMut for PageGuard<T>  {
+impl<T: Swipable> DerefMut for PageGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.data_structure_mut()
     }
