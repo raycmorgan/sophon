@@ -433,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn node_split_many_multi_level() {
         use rand::Rng;
         use std::collections::HashMap;
@@ -506,6 +507,7 @@ mod tests {
 
 
     #[test]
+    #[ignore]
     fn threaded_split_many_multi_level() {
         use rand::Rng;
         use std::sync::Arc;
