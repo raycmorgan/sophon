@@ -12,10 +12,29 @@ use self::node::Node;
 mod node;
 
 // The size of this stack limits the depth that a tree can become.
-// We need to statically hold this max depth, so that we can 
+// We need to statically hold this max depth to avoid heap allocations.
+// 32 should be more than plenty.
+//
+// Worse case, 2 keys per node. Nodes are 16kb. Depth of 32 means we
+// have 2^32 leaf page -- roughly 68TB of leaf pages. In practice,
+// we limit the key size to 2kb, ensuring a minimum fanout of around
+// 7. This means worst case is 7^32 * 16kb, or 1.7E19 TBs of space (infinite).
+//
+// We could reduce the depth to 16, and with a min fanout of 7, have
+// ~500PB of leaf data. This would save stack space.
 type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 
 
+/// `BTree` is a core data structure. It presents a concurrent, thread safe, ordered
+/// map backed by a provided `BufferManager`.
+/// 
+/// `BTree` goes out of its way to not perform heap allocations and to minimize copying
+/// data (outside of actually copying bytes into the `BTree`'s pages) in order to
+/// maximize performance.
+///
+/// `BTree`'s are clonable, as all the backing data is stored within the page data which
+/// is thread safe. For this reason, `BTree`'s are also Send and Sync, safely being able
+/// to be shared across threads without needed `Arc` or other sync primitives wrapping.
 #[derive(Clone)]
 pub struct BTree<'a> {
     buffer_manager: &'a BufferManager,
@@ -23,6 +42,12 @@ pub struct BTree<'a> {
 }
 
 impl<'a> BTree<'a> {
+    /// Create a new `BTree` using the backing `BufferManager`. This will immediately
+    /// ask the `BufferManager` for an initial page, which will be treated as the root
+    /// page for this `BTree`.
+    /// 
+    /// Many `BTree`s can share the same `BufferManager`. For instance, you may want different
+    /// `BTree`s for different indexes or tables in a SQL database.
     pub fn new(buffer_manager: &'a BufferManager) -> Self {
         let root_swip: Swip<Node> = buffer_manager.new_page().unwrap();
         let mut node = root_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
@@ -42,11 +67,16 @@ impl<'a> BTree<'a> {
         }
     }
 
+    /// Insert a key-value pair into the `BTree`. On conflict, this will replace
+    /// the current value in.
+    /// 
+    /// Potential costs:
+    /// 1. It may compact nodes to fit the key-value pair
+    /// 2. It may split nodes to fit the key-value pair
+    /// 3. [once disk backed] It may require loading nodes from disk
     pub fn insert(&self, key: &[u8], value: &[u8]) {
         'outer: loop {
             let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
-
-            // all_children
 
             #[cfg(debug_assertions)] {
                 if !node.shares_prefix(key) {
@@ -163,16 +193,12 @@ impl<'a> BTree<'a> {
                 }
             }
 
-            // if parents == path_len && path[0].has_space_for(key_len, val_len)
-
             // At this point we hold exclusive locks from the leaf up to a parent
             // that can hold a new swip, or the entire path, which means root node.
 
             let mut right_guard = None;
 
             for i in path_len-parents..path_len {
-                // let temp = &mut [0u8; MAX_KEY_LEN];
-
                 let parts = path.split_at_mut(i + 1);
                 let parent = parts.0.last().expect("infallible");
                 let left = parts.1.first().unwrap_or(&node);
@@ -188,8 +214,6 @@ impl<'a> BTree<'a> {
                 // TODO(safety): handle error
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                 let mut right = right_swip.coupled_page_guard::<Node>(None, LatchStrategy::Exclusive).expect("infallible");
-
-                // debug!("[btree] parent.insert: {:?}=>{}", pivot_key, &right_swip.value());
 
                 left.split(&mut right, pivot);
 
@@ -224,13 +248,20 @@ impl<'a> BTree<'a> {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Looks up a value that matches the provided key in the `BTree`,
+    /// returning a copy of the value if found, else returns `None`.
+    /// 
+    /// Cost: Performs a single heap allocation to copy the data from the
+    /// backing page data to return a safe copy.
+    /// 
+    /// TODO: implement Alloc variant `get_in`
+    pub fn get(&self, key: &[u8]) -> Option<Box<[u8]>> {
         let (node, _) = self.search_to_leaf(&key, LatchStrategy::Shared);
-        node.get(key).map(|v| v.to_vec())
+        node.get(key).map(|v| v.to_vec().into_boxed_slice() )
     }
 
-    /// Returned PageGuard are returned locked via `strategy`
-    /// Returned PageGuards in LockPath are Optimistic
+    /// Returned PageGuard is returned locked via `strategy`
+    /// Returned PageGuards in GuardPath are Optimistic
     fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> (PageGuard<Node>, GuardPath) {
         debug!("search_to_leaf: {:?}", key);
 
@@ -288,6 +319,21 @@ impl<'a> BTree<'a> {
         }
     }
 
+    /// Creates an iterator over some range of the `BTree` returning chunks of
+    /// key-value pairs each iteration.
+    /// 
+    /// To limit the amount of returned data (and cloning of said data), caller
+    /// can provide a predicate function to filter out results prior to cloning
+    /// the data.
+    /// 
+    /// Cost: Heap allocates (into the Global allocator), key-value pairs a
+    /// page at a time. Key-value pairs filtered out via the provided predicate
+    /// are not cloned.
+    /// Leaf pages are reader locked while performing predicate scan and
+    /// key-value cloning.
+    /// 
+    /// TODO: Should we provide an interface that allows iterating without any
+    /// heap allocation by holding the lock during the duration of the caller?
     pub fn range<F>(
         &'a self, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, Global, F>
@@ -295,6 +341,11 @@ impl<'a> BTree<'a> {
         self.range_in(Global.clone(), start, end, pred)
     }
 
+    /// See `range`.
+    /// 
+    /// Variant of `range` in which allocation happens on the provided `Alloc`.
+    /// This is useful for the caller to manage alloc/dealloc costs by doing
+    /// things like utilizing a simple Arena allocator in whihc
     pub fn range_in<F, A>(
         &'a self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, A, F>
@@ -364,7 +415,7 @@ mod tests {
         let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
         btree.insert(b"foo", b"bar");
-        assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo"));
+        assert_eq!(Some(b"bar".to_vec().into_boxed_slice()), btree.get(b"foo"));
     }
 
     #[test]
@@ -428,7 +479,7 @@ mod tests {
         }
         
         for (i, (k, v)) in hashmap.iter().enumerate() {
-            assert_eq!(Some(v.to_vec()), btree.get(&k[..]), "Failed on check {}", i);
+            assert_eq!(Some(v.to_vec().into_boxed_slice()), btree.get(&k[..]), "Failed on check {}", i);
         }
     }
 
@@ -469,7 +520,7 @@ mod tests {
         println!("Checking results...");
         
         for (i, (k, v)) in hashmap.iter().enumerate() {
-            if Some(v.to_vec()) != btree.get(&k[..]) {
+            if Some(v.to_vec().into_boxed_slice()) != btree.get(&k[..]) {
                 let (node, path) = btree.search_to_leaf(k, LatchStrategy::OptimisticSpin);
 
                 fn debug_fence_mismatch(node: &PageGuard<Node>) {
