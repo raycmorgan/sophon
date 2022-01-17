@@ -87,19 +87,9 @@ impl<T: Swipable> Swip<T> {
     }
 
     #[inline]
-    pub(crate) fn buffer_frame_mut_ptr(&self) -> *mut BufferFrame {
-        self.ptr as *mut BufferFrame
-    }
-
-    #[inline]
     pub(crate) fn page_id(&self) -> u64 {
         // TODO: mask
         self.ptr as u64
-    }
-
-    #[inline]
-    pub(crate) fn page_guard(self) -> PageGuard<T> {
-        PageGuard::new_optimistic_or_shared(self)
     }
 
     #[inline]

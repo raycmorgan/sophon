@@ -2,7 +2,6 @@ use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 
 use crate::buffer_manager::Swipable;
-use crate::buffer_manager::buffer_frame::BufferFrame;
 use crate::buffer_manager::swip::Swip;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -13,6 +12,7 @@ enum LockState {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(unused)]
 pub(crate) enum LatchStrategy {
     OptimisticSpin,
     OptimisticOrConflict,
@@ -181,18 +181,18 @@ impl<T: Swipable> PageGuard<T> {
         self.swip.value()
     }
 
-    #[inline]
-    pub(crate) fn upgrade_shared(&mut self) {
-        match self.state {
-            LockState::Exclusive => panic!("Cannot call upgrade_shared when exclusive lock is held"),
-            LockState::Shared => (),
-            LockState::Optimistic => {
-                let frame = unsafe { self.swip.as_buffer_frame() };
-                frame.latch_shared();
-                self.state = LockState::Shared;
-            }
-        }
-    }
+    // #[inline]
+    // pub(crate) fn upgrade_shared(&mut self) {
+    //     match self.state {
+    //         LockState::Exclusive => panic!("Cannot call upgrade_shared when exclusive lock is held"),
+    //         LockState::Shared => (),
+    //         LockState::Optimistic => {
+    //             let frame = unsafe { self.swip.as_buffer_frame() };
+    //             frame.latch_shared();
+    //             self.state = LockState::Shared;
+    //         }
+    //     }
+    // }
 
     #[inline]
     pub(crate) fn upgrade_exclusive(&mut self) {

@@ -1,7 +1,5 @@
 use std::alloc::{Allocator, Global};
-use std::ops::{Range, Deref};
-use std::{mem::size_of, fmt::Debug};
-use std::sync::Arc;
+use std::mem::size_of;
 
 use log::debug;
 use stackvec::StackVec;
@@ -9,28 +7,9 @@ use stackvec::StackVec;
 use crate::buffer_manager::swip::OptimisticError;
 use crate::buffer_manager::{BufferManager, swip::Swip, buffer_frame::{PageGuard, LatchStrategy}};
 
-use self::node::{Node, MAX_KEY_LEN};
+use self::node::Node;
 
 mod node;
-// mod key_chunks;
-
-#[derive(Debug, PartialEq)]
-enum InsertError {
-    PageFault(Swip<Node>),
-}
-
-impl From<SearchError> for InsertError {
-    fn from(e: SearchError) -> Self {
-        match e {
-            SearchError::PageFault(s) => InsertError::PageFault(s),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum SearchError {
-    PageFault(Swip<Node>)
-}
 
 // The size of this stack limits the depth that a tree can become.
 // We need to statically hold this max depth, so that we can 
@@ -38,7 +17,7 @@ type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 
 
 #[derive(Clone)]
-struct BTree<'a> {
+pub struct BTree<'a> {
     buffer_manager: &'a BufferManager,
     root_page: Swip<Node>,
 }
@@ -63,9 +42,9 @@ impl<'a> BTree<'a> {
         }
     }
 
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
+    pub fn insert(&self, key: &[u8], value: &[u8]) {
         'outer: loop {
-            let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive)?;
+            let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
 
             // all_children
 
@@ -98,7 +77,7 @@ impl<'a> BTree<'a> {
             }
 
             match node.insert(&key, &value) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return,
                 Err(node::InsertError::InsufficientSpace) => (),
             };
 
@@ -123,7 +102,7 @@ impl<'a> BTree<'a> {
                     right.insert(key, value).expect("Space to now exist");
                 }
 
-                return Ok(());
+                return;
             }
 
             // We need to split the page, start by locking parents until we either
@@ -241,18 +220,18 @@ impl<'a> BTree<'a> {
                 right.insert(key, value).expect("Space to now exist");
             }
 
-            return Ok(());
+            return;
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SearchError> {
-        let (node, _) = self.search_to_leaf(&key, LatchStrategy::Shared)?;
-        Ok(node.get(key).map(|v| v.to_vec()))
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let (node, _) = self.search_to_leaf(&key, LatchStrategy::Shared);
+        node.get(key).map(|v| v.to_vec())
     }
 
     /// Returned PageGuard are returned locked via `strategy`
     /// Returned PageGuards in LockPath are Optimistic
-    fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> Result<(PageGuard<Node>, GuardPath), SearchError> {
+    fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> (PageGuard<Node>, GuardPath) {
         debug!("search_to_leaf: {:?}", key);
 
         'restart: loop {
@@ -277,7 +256,7 @@ impl<'a> BTree<'a> {
                         Err(OptimisticError::Conflict) => continue 'restart,
                     };
 
-                    return Ok((node, path));
+                    return (node, path);
                 } else {
                     let s = node.get_next(&key).expect("All inner nodes should return _something_");
                     let ptr = usize::from_ne_bytes(s.try_into().expect("8 byte response"));
@@ -296,7 +275,9 @@ impl<'a> BTree<'a> {
                         // child needs to be updated to unswizzle the pointer in the page.
                         // Alt: Maybe just swizzle sync?
                         // Also: Parallel swizzling for scans would be neat
-                        return Err(SearchError::PageFault(child));
+                        // return Err(SearchError::PageFault(child));
+
+                        todo!("implement unswizzling");
                     }
 
                     // Safety: Assuming path's default value is large enough to hold tree depth
@@ -307,14 +288,14 @@ impl<'a> BTree<'a> {
         }
     }
 
-    pub(crate) fn range<F>(
+    pub fn range<F>(
         &'a self, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, Global, F>
     where F: Fn(&[u8]) -> bool + Clone {
         self.range_in(Global.clone(), start, end, pred)
     }
 
-    pub(crate) fn range_in<F, A>(
+    pub fn range_in<F, A>(
         &'a self, alloc: A, start: &[u8], end: Option<&'a [u8]>, pred: F
     ) -> BTreeRange<'a, A, F>
     where F: Fn(&[u8]) -> bool, A: Allocator + Clone {
@@ -328,7 +309,7 @@ impl<'a> BTree<'a> {
     }
 }
 
-struct BTreeRange<'a, A: Allocator + Clone, F>
+pub struct BTreeRange<'a, A: Allocator + Clone, F>
     where F: Fn(&[u8]) -> bool
 {
     btree: &'a BTree<'a>,
@@ -349,7 +330,7 @@ impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
         }
 
         let fence = self.lower_fence.take().unwrap();
-        let (node, _) = self.btree.search_to_leaf(&fence, LatchStrategy::Shared).unwrap();
+        let (node, _) = self.btree.search_to_leaf(&fence, LatchStrategy::Shared);
 
         let upper_fence = node.upper_fence();
         if upper_fence.len() == 0 {
@@ -382,8 +363,8 @@ mod tests {
     fn insert_get() {
         let bm = make_buffer_manager();
         let btree = BTree::new(&bm);
-        btree.insert(b"foo", b"bar").unwrap();
-        assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo").unwrap());
+        btree.insert(b"foo", b"bar");
+        assert_eq!(Some(b"bar".to_vec()), btree.get(b"foo"));
     }
 
     #[test]
@@ -391,12 +372,12 @@ mod tests {
         let bm = make_buffer_manager();
 
         let btree = BTree::new(&bm);
-        btree.insert(b"aaa", b"aaa").unwrap();
-        btree.insert(b"bbb", b"bbb").unwrap();
-        btree.insert(b"ccc", b"ccc").unwrap();
-        btree.insert(b"ddd", b"ddd").unwrap();
-        btree.insert(b"eee", b"eee").unwrap();
-        btree.insert(b"fff", b"fff").unwrap();
+        btree.insert(b"aaa", b"aaa");
+        btree.insert(b"bbb", b"bbb");
+        btree.insert(b"ccc", b"ccc");
+        btree.insert(b"ddd", b"ddd");
+        btree.insert(b"eee", b"eee");
+        btree.insert(b"fff", b"fff");
 
         let range = btree.range(b"aaa", Some(b"d"), |_| true);
         for chunk in range {
@@ -412,19 +393,19 @@ mod tests {
     }
 
     // #[test]
-    fn node_split_big_values() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let bm = make_buffer_manager();
+    // fn node_split_big_values() {
+    //     let _ = env_logger::builder().is_test(true).try_init();
+    //     let bm = make_buffer_manager();
 
-        let btree = BTree::new(&bm);
-        btree.insert(b"foo", &[1u8; 1028 * 10]).unwrap();
-        btree.insert(b"bar", &[2u8; 1028 * 10]).unwrap();
-        btree.insert(b"mmm", &[3u8; 1028 * 10]).unwrap();
+    //     let btree = BTree::new(&bm);
+    //     btree.insert(b"foo", &[1u8; 1028 * 10]);
+    //     btree.insert(b"bar", &[2u8; 1028 * 10]);
+    //     btree.insert(b"mmm", &[3u8; 1028 * 10]);
 
-        assert_eq!(Some([1u8; 1028 * 10].to_vec()), btree.get(b"foo").unwrap());
-        assert_eq!(Some([2u8; 1028 * 10].to_vec()), btree.get(b"bar").unwrap());
-        assert_eq!(Some([3u8; 1028 * 10].to_vec()), btree.get(b"mmm").unwrap());
-    }
+    //     assert_eq!(Some([1u8; 1028 * 10].to_vec()), btree.get(b"foo"));
+    //     assert_eq!(Some([2u8; 1028 * 10].to_vec()), btree.get(b"bar"));
+    //     assert_eq!(Some([3u8; 1028 * 10].to_vec()), btree.get(b"mmm"));
+    // }
 
     #[test]
     fn node_split_many_single_level() {
@@ -442,12 +423,12 @@ mod tests {
             let key = rand::thread_rng().gen::<[u8; 32]>();
             let value = rand::thread_rng().gen::<[u8; 32]>();
 
-            btree.insert(&key, &value).unwrap();
+            btree.insert(&key, &value);
             hashmap.insert(key, value);
         }
         
         for (i, (k, v)) in hashmap.iter().enumerate() {
-            assert_eq!(Some(v.to_vec()), btree.get(&k[..]).unwrap(), "Failed on check {}", i);
+            assert_eq!(Some(v.to_vec()), btree.get(&k[..]), "Failed on check {}", i);
         }
     }
 
@@ -477,7 +458,7 @@ mod tests {
         let start = Instant::now();
         
         for (k, v) in &vec {
-            btree.insert(k, v).unwrap();
+            btree.insert(k, v);
         }
 
         let elapsed = start.elapsed().as_nanos();
@@ -487,8 +468,8 @@ mod tests {
         println!("Checking results...");
         
         for (i, (k, v)) in hashmap.iter().enumerate() {
-            if Some(v.to_vec()) != btree.get(&k[..]).unwrap() {
-                let (node, path) = btree.search_to_leaf(k, LatchStrategy::OptimisticSpin).unwrap();
+            if Some(v.to_vec()) != btree.get(&k[..]) {
+                let (node, path) = btree.search_to_leaf(k, LatchStrategy::OptimisticSpin);
 
                 fn debug_fence_mismatch(node: &PageGuard<Node>) {
                     let children = node.all_children();
@@ -527,6 +508,7 @@ mod tests {
     #[test]
     fn threaded_split_many_multi_level() {
         use rand::Rng;
+        use std::sync::Arc;
 
         let _ = env_logger::builder().is_test(true).try_init();
 
@@ -566,7 +548,7 @@ mod tests {
                     let btree = inner_btree;
 
                     for (k, v) in vec.into_iter() {
-                        btree.insert(&k, &v).unwrap();
+                        btree.insert(&k, &v);
                     }
                     
                     // for (_i, (k, v)) in hashmap.iter().enumerate() {

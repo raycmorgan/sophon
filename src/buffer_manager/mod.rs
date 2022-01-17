@@ -1,7 +1,6 @@
 use crate::buffer_manager::swip::Swip;
 use std::{fmt, mem::size_of};
 use std::cell::UnsafeCell;
-use madvise::AdviseMemory;
 use memmap::MmapMut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,7 +9,7 @@ use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED, PAGE_SIZE};
 pub(crate) mod swip;
 pub(crate) mod buffer_frame;
 
-pub(crate) struct BufferManager {
+pub struct BufferManager {
     base_page_size: usize,
     max_memory: usize,
     page_classes: Vec<PageClass>,
@@ -65,7 +64,7 @@ impl BufferManager {
         }
     }
 
-    pub fn new_page<T: Swipable>(&self) -> Result<Swip<T>, AllocError> {
+    pub(crate) fn new_page<T: Swipable>(&self) -> Result<Swip<T>, AllocError> {
         // Simple bump allocation of pages
         // TODO: implement reuse after free
         let page_id = self.page_counter.fetch_add(1, Ordering::SeqCst);
@@ -98,7 +97,7 @@ impl BufferManager {
     pub fn free_page() {}
     pub fn flush_pages() {}
 
-    pub async fn load_unswizzled(&self, unswizzle: usize) -> &mut [u8] {
+    pub async fn load_unswizzled(&self, _unswizzle: usize) -> &mut [u8] {
         // TODO: This function will look at the cooling stage and either reheat
         // or perform a fetch from the cold store (disk). The latter is why this
         // function is async -- if it needs to go to disk, that will require an
@@ -159,16 +158,17 @@ impl PageClass {
         &mut mmap[start..start+self.page_size]
     }
 
-    /// Safety: Calling this will clear out the data underlying the page. It
-    /// is up to the users of this and get_page to manage race conditions that
-    /// may occur.
-    unsafe fn release_page(&self, page_id: usize) {
-        // TODO: what to do when the advise fails?
+    // /// Safety: Calling this will clear out the data underlying the page. It
+    // /// is up to the users of this and get_page to manage race conditions that
+    // /// may occur.
+    // unsafe fn release_page(&self, page_id: usize) {
+    //     use madvise::AdviseMemory;
+    //     // TODO: what to do when the advise fails?
 
-        let start = page_id * self.page_size;
-        let mmap = self.mmap.get().as_ref().unwrap();
-        let _ = mmap[start..start+self.page_size]
-            .advise_memory_access(madvise::AccessPattern::DontNeed)
-            .unwrap();
-    }
+    //     let start = page_id * self.page_size;
+    //     let mmap = self.mmap.get().as_ref().unwrap();
+    //     let _ = mmap[start..start+self.page_size]
+    //         .advise_memory_access(madvise::AccessPattern::DontNeed)
+    //         .unwrap();
+    // }
 }

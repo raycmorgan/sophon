@@ -128,11 +128,8 @@ impl Node {
         self.header.space_used = (prefix.len() + lower_fence.len() + upper_fence.len()).try_into().unwrap();
         self.header.space_active = (prefix.len() + lower_fence.len() + upper_fence.len()).try_into().unwrap();
 
-        let data_capacity = self.header.data_capacity;
         let data_len = self.data().len();
         let mut_data = self.data_mut();
-
-        // println!("self.header.data_capacity: {}, data_len: {}", data_capacity, data_len);
 
         mut_data[data_len-prefix.len()..].copy_from_slice(prefix);
 
@@ -287,6 +284,7 @@ impl Node {
         Some(self.get_data_value(slot))
     }
 
+    #[allow(unused)]
     pub(crate) fn delete(&mut self, key: &[u8]) {
         debug_assert!(key.len() < MAX_KEY_LEN);
         debug_assert!(&key[..self.header.prefix_len as usize] == self.prefix());
@@ -298,8 +296,10 @@ impl Node {
             let slot_count = self.header.slot_count as usize;
 
             if i + 1 < slot_count {
-                let slots = self.slots_mut_unbounded();
-                slots.copy_within(i+1..slot_count, i);
+                unsafe {
+                    let slots = self.slots_mut_unbounded();
+                    slots.copy_within(i+1..slot_count, i);
+                }
             }
 
             self.header.slot_count -=1;
@@ -307,6 +307,7 @@ impl Node {
     }
 
     #[inline]
+    #[allow(unused)]
     pub(crate) fn utilization(&self) -> f32 {
         self.header.data_capacity as f32 / self.header.space_active as f32
     }
@@ -352,29 +353,6 @@ impl Node {
         let value_len = pivot_slot.data_len as usize;
 
         (pivot, key_len, value_len)
-    }
-
-    #[inline]
-    pub(crate) fn pivot_key_for_split<'b>(&self, key: &[u8], _value_len: usize, dst: &'b mut [u8]) -> &'b [u8] {
-        // TODO: Optimize split based on contents and position of data.
-        // For example, if the key is greater than all items in the node,
-        //   the right page should be mostly empty (optimize for appends).
-
-        let pivot = (self.header.slot_count as usize) / 2;
-        let pivot_slot = self.slots()[pivot];
-        let temp = &mut [0u8; MAX_KEY_LEN];
-
-        let pivot_key = self.copy_key(pivot_slot, temp);
-
-        // Special case: there is only 1 element and the new key is less than the
-        // existing key. We want to make sure the new key is inserted into the
-        // left node and the existing item moves to the right node.
-        // if pivot == 0 && key < pivot_key {
-        //     dst[0..key.len()].copy_from_slice(key);
-        //     return &dst[0..key.len()];
-        // }
-
-        return self.copy_key(pivot_slot, dst);
     }
 
     #[inline]
@@ -701,16 +679,15 @@ impl Node {
         }
     }
 
+    /// Safety: This returns a slice of Slots with the len being equal
+    /// to the entire data region of the Node. The caller must understand
+    /// the internals, and ensure they aren't clobbering other data.
     #[inline]
-    fn slots_mut_unbounded(&mut self) -> &mut [Slot] {
-        unsafe {
-            // &self.contents.slots[0..self.header.slot_count as usize]
-
-            std::slice::from_raw_parts_mut(
-                self.contents.data.as_mut_ptr() as *mut Slot, 
-                self.header.data_capacity as usize / size_of::<Slot>()
-            )
-        }
+    unsafe fn slots_mut_unbounded(&mut self) -> &mut [Slot] {
+        std::slice::from_raw_parts_mut(
+            self.contents.data.as_mut_ptr() as *mut Slot, 
+            self.header.data_capacity as usize / size_of::<Slot>()
+        )
     }
 
     #[inline]
@@ -757,6 +734,7 @@ impl Node {
     }
 
     #[inline]
+    #[allow(unused)]
     pub (crate) fn pid(&self) -> u64 {
         self.header.pid
     }
@@ -790,14 +768,34 @@ impl Node {
     }
 }
 
-type KeyParts<'a> = (&'a [u8], &'a [u8]);
+impl Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
+        let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
 
-#[inline]
-fn slot_key(key: &[u8]) -> [u8; SLOT_KEY_LEN] {
-    let mut k = [0u8; SLOT_KEY_LEN];
-    k.copy_from_slice(&key[0..SLOT_KEY_LEN.min(key.len())]);
-    k
+        f.debug_struct("Node")
+            .field("is_leaf", &self.is_leaf())
+            .field("height", &self.header.height)
+            // .field("lower_fence", &self.header.lower_fence)
+            // .field("upper_fence", &self.header.upper_fence)
+            .field("lower_fence", &lower_fence)
+            .field("upper_fence", &upper_fence)
+            .field("prefix", &self.prefix())
+            .field("available_space", &(self.header.data_capacity as usize - self.header.space_used as usize))
+            .finish()
+    }
 }
+
+impl Debug for PageGuard<Node> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageGuard<Node>")
+            .field("ptr", &self.swip_value())
+            .field("ref", self.deref())
+            .finish()
+    }
+}
+
+type KeyParts<'a> = (&'a [u8], &'a [u8]);
 
 #[inline]
 fn key_parts(key: &[u8]) -> KeyParts {
@@ -882,62 +880,3 @@ mod tests {
         assert_eq!(None, node.get(b"foo"));
     }
 }
-
-impl Debug for Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let lower_fence = &self.lower_fence()[0..self.lower_fence().len().min(5)];
-        let upper_fence = &self.upper_fence()[0..self.upper_fence().len().min(5)];
-
-        f.debug_struct("Node")
-            .field("is_leaf", &self.is_leaf())
-            .field("height", &self.header.height)
-            // .field("lower_fence", &self.header.lower_fence)
-            // .field("upper_fence", &self.header.upper_fence)
-            .field("lower_fence", &lower_fence)
-            .field("upper_fence", &upper_fence)
-            .field("prefix", &self.prefix())
-            .field("available_space", &(self.header.data_capacity as usize - self.header.space_used as usize))
-            .finish()
-    }
-}
-
-impl Debug for PageGuard<Node> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PageGuard<Node>")
-            .field("ptr", &self.swip_value())
-            .field("ref", self.deref())
-            .finish()
-    }
-}
-
-
-
-
-// ----
-
-#[repr(C)]
-struct LargeNode {
-    raw_len: usize,
-    // raw: ?? I literally have a chunk of memory here..
-    raw: [u8; 1], // This actually has space in it, just using it as a marker
-}
-
-impl LargeNode {
-    fn raw(&mut self) -> &mut [u8] {
-        let ptr = self.raw.as_mut_ptr();
-        unsafe { 
-            std::slice::from_raw_parts_mut(ptr, self.raw_len)
-        }
-    }
-
-    fn bump(&mut self) {
-        self.raw()[0..4].copy_from_slice(&[0u8; 4]);
-    }
-}
-
-// fn foo() { 
-//     let mut swip: Swip<Node> = Swip::new(1);
-//     let mut guard = ExclusiveGuard::new(&mut swip);
-//     let dts = guard.data_structure();
-//     let _s: Swip<LargeNode> = Swip::new(2);
-// }

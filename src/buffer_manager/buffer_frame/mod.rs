@@ -1,4 +1,4 @@
-use std::{mem::size_of, sync::atomic::{AtomicU64, Ordering}, marker::PhantomData};
+use std::{mem::size_of, sync::atomic::{AtomicU64, Ordering}};
 use parking_lot::{RawRwLock as RwLock, lock_api::{RawRwLock, RawRwLockUpgrade}};
 
 mod page_guard;

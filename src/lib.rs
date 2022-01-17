@@ -8,4 +8,4 @@
 #![feature(allocator_api)]
 
 pub mod btree2;
-mod buffer_manager;
+pub mod buffer_manager;
