@@ -1,481 +1,719 @@
-use std::io::IntoInnerError;
-use std::ops::Range;
-use std::path::PathBuf;
-use byte_unit::{n_kib_bytes, n_mib_bytes};
+use std::alloc::{Allocator, Global};
+use std::mem::size_of;
 
-use crate::{DiskManager, DiskManagerAllocError, Unswizzle, Swip, buffer_manager};
+use log::debug;
+use stackvec::StackVec;
 
-// use crate::buffer_manager::Page;
+use crate::buffer_manager::swip::OptimisticError;
+use crate::buffer_manager::{
+    buffer_frame::{LatchStrategy, PageGuard},
+    swip::Swip,
+    BufferManager,
+};
 
-mod page;
+use self::node::Node;
 
-// const NODE_TYPE_INNER: u64 = 1;
-// const NODE_TYPE_LEAF: u64 = 1 << 1;
+mod node;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(u64)]
-pub(crate) enum NodeType {
-    // 0bxx represents node type
-    Inner = 0b0001,
-    Leaf  = 0b0010,
-}
+// The size of this stack limits the depth that a tree can become.
+// We need to statically hold this max depth to avoid heap allocations.
+// 32 should be more than plenty.
+//
+// Worse case, 2 keys per node. Nodes are 16kb. Depth of 32 means we
+// have 2^32 leaf page -- roughly 68TB of leaf pages. In practice,
+// we limit the key size to 2kb, ensuring a minimum fanout of around
+// 7. This means worst case is 7^32 * 16kb, or 1.7E19 TBs of space (infinite).
+//
+// We could reduce the depth to 16, and with a min fanout of 7, have
+// ~500PB of leaf data. This would save stack space.
+type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 
-impl TryFrom<&[u8]> for NodeType {
-    type Error = std::array::TryFromSliceError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let res = u64::from_le_bytes(value[0..8].try_into()?);
-        if res & (NodeType::Inner as u64) > 0 {
-            return Ok(NodeType::Inner);
-        } else if res & (NodeType::Leaf as u64) > 0 {
-            return Ok(NodeType::Leaf);
-        } else {
-            panic!("Invalid header. {:?}", &value[0..8]);
-        }
-    }
-}
-
-use crate::buffer_manager::BufferManager;
-use page::Page;
-
-use self::page::PageIter;
-
-struct BTree<'a> {
+/// `BTree` is a core data structure. It presents a concurrent, thread safe, ordered
+/// map backed by a provided `BufferManager`.
+///
+/// `BTree` goes out of its way to not perform heap allocations and to minimize copying
+/// data (outside of actually copying bytes into the `BTree`'s pages) in order to
+/// maximize performance.
+///
+/// `BTree`'s are clonable, as all the backing data is stored within the page data which
+/// is thread safe. For this reason, `BTree`'s are also Send and Sync, safely being able
+/// to be shared across threads without needed `Arc` or other sync primitives wrapping.
+#[derive(Clone)]
+pub struct BTree<'a> {
     buffer_manager: &'a BufferManager,
-    root_page: Page<'a>,
+    root_page: Swip<Node>,
 }
 
 impl<'a> BTree<'a> {
-    pub fn from(buffer_manager: &'a BufferManager, root_page: &'a mut [u8]) -> Self {
-        let mut root_page = Page::from(root_page);
+    /// Create a new `BTree` using the backing `BufferManager`. This will immediately
+    /// ask the `BufferManager` for an initial page, which will be treated as the root
+    /// page for this `BTree`.
+    ///
+    /// Many `BTree`s can share the same `BufferManager`. For instance, you may want different
+    /// `BTree`s for different indexes or tables in a SQL database.
+    pub fn new(buffer_manager: &'a BufferManager) -> Self {
+        let root_swip: Swip<Node> = buffer_manager.new_page().unwrap();
+        let mut node = root_swip
+            .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+            .expect("infallible");
 
-        let initial_version = buffer_manager.version_boundary();
-        unsafe { root_page.init(initial_version) };
+        node.init_header(
+            1,
+            root_swip.page_id(),
+            0,
+            // None,
+            true,
+            b"",
+            b"",
+        );
 
         BTree {
-            buffer_manager,
-            root_page,
+            buffer_manager: buffer_manager,
+            root_page: root_swip,
         }
     }
 
-    pub fn bootstrap(buffer_manager: &'a BufferManager, data: (Unswizzle, &'a mut [u8])) -> Result<Self, DiskManagerAllocError> {
-        let mut root_page = Page::from(data.1);
-        let initial_version = buffer_manager.version_boundary();
-
-        unsafe {
-            let leaf_data = buffer_manager.new_page()?;
-            let mut leaf_page = Page::from(leaf_data.1);
-            leaf_page.bootstrap_leaf(leaf_data.0.into(), &[], initial_version);
-            root_page.bootstrap_inner(data.0, &[], (b"", leaf_data.0), initial_version);
-        }
-
-        Ok(BTree {
-            buffer_manager,
-            root_page,
-        })
-    }
-
+    /// Insert a key-value pair into the `BTree`. On conflict, this will replace
+    /// the current value in.
+    ///
+    /// Potential costs:
+    /// 1. It may compact nodes to fit the key-value pair
+    /// 2. It may split nodes to fit the key-value pair
+    /// 3. [once disk backed] It may require loading nodes from disk
     pub fn insert(&self, key: &[u8], value: &[u8]) {
-        let res = self.search_to_leaf(key, None)
-            .and_then(|mut p| {
-                p.write_lock().map_err(|e| e.into())
-            });
+        'outer: loop {
+            let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
 
-        let mut lock = match res {
-            Ok(l) => l,
-            Err(e) => todo!("Handle err case: {:?}", e),
-        };
+            #[cfg(debug_assertions)]
+            {
+                if !node.shares_prefix(key) {
+                    let children = path.last().unwrap().all_children();
 
-        match lock.insert(key, value) {
-            Ok(()) => (),
-            Err(e) => {
-                todo!("We need to handle error cases! {:?}", e);
-            }
-        }   
-    }
+                    children.windows(2).for_each(|w| {
+                        let left = &w[0];
+                        let right = &w[1];
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        loop {
-            match self.get_(key) {
-                Ok(r) => return r,
-                Err(SearchError::OptimisticConflict) => continue,
-            }
-        }
-    }
+                        if left.upper_fence() != right.lower_fence() {
+                            println!("Fence mismatch:\nLeft: {:?}\nRight: {:?}", left, right);
+                        }
+                    });
 
-    #[inline]
-    fn get_(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SearchError> {
-        let page = self.search_to_leaf(key, None)?;
+                    panic!("Key: {:?}\n\nNode: {:?}\n\nPath: {:?}", key, node, path);
+                }
 
-        let pre_version = page.version()?;
-        let res = match page.search(key) {
-            // We need to clone the data and then validate the version. This
-            // ensures that the caller isn't looking at invalide data.
-            Ok(v) => Some(v.into()),
-            Err(_) => None,
-        };
+                path.windows(2).for_each(|w| {
+                    let parent = &w[0];
+                    let child = &w[1];
+                    debug_assert!(
+                        parent.contains(&child),
+                        "Parent: {:?}\n  Child: {:?}",
+                        parent,
+                        child
+                    );
+                });
 
-        if pre_version != page.version()? {
-            Err(SearchError::OptimisticConflict)
-        } else {
-            Ok(res)
-        }
-    }
-
-    // pub fn scan(&self, range: Range<&[u8]>)
-
-    fn search_to_leaf(&self, key: &[u8], inner_page: Option<Page>) -> Result<Page<'a>, SearchError> {
-        let page = inner_page.as_ref().unwrap_or(&self.root_page);
-        let pre_version = page.version()?;
-
-        // Conversion into the Swip will copy the underlying bytes. Therefore
-        // after this we can validate with confidence that we have a valid
-        // pointer.
-        // What happens if after we do this the referenced page is unswizzled?
-        let swip: Swip = page.get_nearby(key).into();
-
-        let post_version = page.version()?;
-        if pre_version != post_version {
-            return Err(SearchError::OptimisticConflict);
-        }
-
-        match swip {
-            Swip::Swizzle(s) => {
-                // Safety: we know that the root page is an inner page. And
-                // we know data from inner pages are Swips
-                let data = unsafe { self.buffer_manager.load_swizzled(s) };
-                let child = Page::from(data);
-
-                match child.page_type() {
-                    NodeType::Inner => {
-                        return self.search_to_leaf(key, Some(child));
-                    }
-
-                    NodeType::Leaf => {
-                        return Ok(child);
-                    }
+                if let Some(parent) = path.last() {
+                    debug_assert!(
+                        parent.contains(&node),
+                        "Parent: {:?}\n  Child: {:?}",
+                        parent,
+                        node
+                    );
                 }
             }
 
-            Swip::Unswizzle(u) => {
-                todo!("Need to load Unswizzle from disk");
+            match node.insert(&key, &value) {
+                Ok(()) => return,
+                Err(node::InsertError::InsufficientSpace) => (),
+            };
+
+            if path.len() == 0 {
+                debug!("SPLIT ROOT #1");
+
+                let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+                let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+
+                let mut right = right_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
+                let mut left = left_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
+
+                // let pivot_key = node.pivot_key_for_split(&key, value.len(), &mut temp);
+                let (pivot, _, _) = node.pivot_for_split();
+                node.root_split(&mut left, &mut right, pivot);
+
+                if key < left.upper_fence() {
+                    debug!("Inserting Left: k:{:?} v:({})", key, value.len());
+                    left.insert(key, value).expect("Space to now exist");
+                } else {
+                    debug!("Inserting Right: k:{:?} v:({})", key, value.len());
+                    right.insert(key, value).expect("Space to now exist");
+                }
+
+                return;
+            }
+
+            // We need to split the page, start by locking parents until we either
+            // hit the root, or we've found a parent that has space for a new page
+            // pointer.
+            let path_len = path.len();
+            let mut parents = 0usize;
+
+            while path_len - parents > 0 {
+                parents += 1;
+
+                let parts = path.split_at_mut(path_len - parents + 1);
+                let parent = parts.0.last_mut().expect("infallible");
+                let child = parts.1.first().unwrap_or(&node);
+
+                // let parent = &mut path[path_len - parents];
+                let version = parent.version();
+                parent.upgrade_exclusive();
+
+                if version != parent.version() {
+                    debug!("Version mismatch, restart.");
+                    continue 'outer;
+                }
+
+                // let child = path.get(path_len - parents - 1).unwrap_or(&node);
+                let (pivot, klen, _vlen) = child.pivot_for_split();
+
+                if parent.has_space_for(klen, size_of::<u64>()) {
+                    break;
+                } else if parents == path_len {
+                    // we need to split the root!
+
+                    debug!("SPLIT ROOT #2");
+
+                    let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+                    let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+
+                    let mut right = right_swip
+                        .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                        .expect("infallible");
+                    let mut left = left_swip
+                        .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                        .expect("infallible");
+
+                    parent.root_split(&mut left, &mut right, pivot);
+
+                    let s = node
+                        .get_next(&key)
+                        .expect("All inner nodes should return _something_");
+
+                    let n = if s == left.swip_bytes() {
+                        right.downgrade();
+                        left
+                    } else {
+                        left.downgrade();
+                        right
+                    };
+
+                    parent.downgrade();
+                    let _ = path.pop();
+                    path.try_push(n).expect("infallible");
+
+                    break;
+                }
+            }
+
+            // At this point we hold exclusive locks from the leaf up to a parent
+            // that can hold a new swip, or the entire path, which means root node.
+
+            let mut right_guard = None;
+
+            for i in path_len - parents..path_len {
+                let parts = path.split_at_mut(i + 1);
+                let parent = parts.0.last().expect("infallible");
+                let left = parts.1.first().unwrap_or(&node);
+
+                debug_assert!(parent.contains(left),
+                    "Mismatched fences between parent and child.\nKey: {:?}\nParent: {:?}\nLeft: {:?}\n\nPath: {:?}\nNode:{:?}",
+                    key, parent, left, parts, node);
+
+                let parent = parts.0.last_mut().expect("infallible");
+                let left = parts.1.first_mut().unwrap_or(&mut node);
+                let (pivot, klen, vlen) = left.pivot_for_split();
+
+                // TODO(safety): handle error
+                let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+                let mut right = right_swip
+                    .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                    .expect("infallible");
+
+                left.split(&mut right, pivot);
+
+                debug_assert!(parent.shares_prefix(right.lower_fence()));
+                debug_assert!(
+                    parent.contains(&right),
+                    "Parent: {:?}\n  Left: {:?}\n  Right: {:?}",
+                    parent,
+                    left,
+                    right
+                );
+
+                match parent.insert_inner(&right) {
+                    Ok(()) => (),
+                    Err(e) => panic!(
+                        "Error: {:?} trying to insert {}\n{:?}",
+                        e,
+                        klen + vlen,
+                        parent
+                    ),
+                };
+                parent.downgrade();
+
+                if !left.is_leaf() && key >= left.upper_fence() {
+                    path[i + 1] = right;
+                } else {
+                    right_guard = Some(right);
+                }
+            }
+
+            if key < node.upper_fence() {
+                debug_assert!(node.shares_prefix(key));
+                node.insert(key, value).expect("Space to now exist");
+            } else {
+                let mut right = right_guard.expect("infallible");
+                debug_assert!(right.shares_prefix(key));
+                debug_assert!(key >= right.lower_fence());
+                right.insert(key, value).expect("Space to now exist");
+            }
+
+            return;
+        }
+    }
+
+    /// Looks up a value that matches the provided key in the `BTree`,
+    /// returning a copy of the value if found, else returns `None`.
+    ///
+    /// Cost: Performs a single heap allocation to copy the data from the
+    /// backing page data to return a safe copy.
+    ///
+    /// TODO: implement Alloc variant `get_in`
+    pub fn get(&self, key: &[u8]) -> Option<Box<[u8]>> {
+        let (node, _) = self.search_to_leaf(&key, LatchStrategy::Shared);
+        node.get(key).map(|v| v.to_vec().into_boxed_slice())
+    }
+
+    /// Returned PageGuard is returned locked via `strategy`
+    /// Returned PageGuards in GuardPath are Optimistic
+    fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> (PageGuard<Node>, GuardPath) {
+        debug!("search_to_leaf: {:?}", key);
+
+        'restart: loop {
+            let mut path: GuardPath = Default::default();
+            let mut swip = self.root_page;
+
+            loop {
+                let parent = path.last();
+                let node = match swip.coupled_page_guard(parent, LatchStrategy::OptimisticSpin) {
+                    Ok(n) => n,
+                    Err(OptimisticError::Conflict) => continue 'restart,
+                };
+
+                if let Some(parent) = parent {
+                    debug_assert!(
+                        parent.contains(&node),
+                        "Parent: {:?}\n  Node: {:?}",
+                        parent,
+                        node
+                    );
+                }
+
+                if node.is_leaf() {
+                    // TODO: If we tracked height, we could perform this Shared latch without the spin above
+                    let node = match swip.coupled_page_guard(parent, strategy) {
+                        Ok(n) => n,
+                        Err(OptimisticError::Conflict) => continue 'restart,
+                    };
+
+                    return (node, path);
+                } else {
+                    let s = node
+                        .get_next(&key)
+                        .expect("All inner nodes should return _something_");
+                    let ptr = usize::from_ne_bytes(s.try_into().expect("8 byte response"));
+
+                    let child: Swip<Node> = Swip::new(ptr);
+
+                    // Need to make sure the data in this node didn't shift under us
+                    // TODO: is this actually needed?
+                    if !node.is_valid() {
+                        continue;
+                    }
+
+                    if !child.is_swizzled() {
+                        // I assume I will need more information to perform the load.
+                        // Possibly the path is enough, but in the end, the owner of the
+                        // child needs to be updated to unswizzle the pointer in the page.
+                        // Alt: Maybe just swizzle sync?
+                        // Also: Parallel swizzling for scans would be neat
+                        // return Err(SearchError::PageFault(child));
+
+                        todo!("implement unswizzling");
+                    }
+
+                    // Safety: Assuming path's default value is large enough to hold tree depth
+                    path.try_push(node).unwrap();
+                    swip = child
+                }
             }
         }
     }
-}
 
+    /// Creates an iterator over some range of the `BTree` returning chunks of
+    /// key-value pairs each iteration.
+    ///
+    /// To limit the amount of returned data (and cloning of said data), caller
+    /// can provide a predicate function to filter out results prior to cloning
+    /// the data.
+    ///
+    /// Cost: Heap allocates (into the Global allocator), key-value pairs a
+    /// page at a time. Key-value pairs filtered out via the provided predicate
+    /// are not cloned.
+    /// Leaf pages are reader locked while performing predicate scan and
+    /// key-value cloning.
+    ///
+    /// TODO: Should we provide an interface that allows iterating without any
+    /// heap allocation by holding the lock during the duration of the caller?
+    pub fn range<F>(
+        &'a self,
+        start: &[u8],
+        end: Option<&'a [u8]>,
+        pred: F,
+    ) -> BTreeRange<'a, Global, F>
+    where
+        F: Fn(&[u8]) -> bool + Clone,
+    {
+        self.range_in(Global.clone(), start, end, pred)
+    }
 
-use page::PageIterKey;
-
-struct ScanIterator<'a> {
-    btree: &'a BTree<'a>,
-    range: Range<&'a [u8]>,
-    leaf: Option<Page<'a>>,
-}
-
-impl<'a> ScanIterator<'a> {
-    fn new(btree: &'a BTree<'a>, range: Range<&'a [u8]>) -> Self {
-        ScanIterator {
-            btree,
-            range,
-            leaf: None,
+    /// See `range`.
+    ///
+    /// Variant of `range` in which allocation happens on the provided `Alloc`.
+    /// This is useful for the caller to manage alloc/dealloc costs by doing
+    /// things like utilizing a simple Arena allocator in whihc
+    pub fn range_in<F, A>(
+        &'a self,
+        alloc: A,
+        start: &[u8],
+        end: Option<&'a [u8]>,
+        pred: F,
+    ) -> BTreeRange<'a, A, F>
+    where
+        F: Fn(&[u8]) -> bool,
+        A: Allocator + Clone,
+    {
+        BTreeRange {
+            btree: &self,
+            lower_fence: Some(start.to_vec()),
+            upper_bound: end,
+            pred,
+            alloc,
         }
     }
 }
 
-impl<'a> Iterator for ScanIterator<'a> {
-    type Item = (PageIterKey<'a>, &'a [u8]);
+pub struct BTreeRange<'a, A: Allocator + Clone, F>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    btree: &'a BTree<'a>,
+    lower_fence: Option<Vec<u8>>,
+    upper_bound: Option<&'a [u8]>,
+    alloc: A,
+    pred: F,
+}
+
+impl<'a, A: Allocator + Clone, F> Iterator for BTreeRange<'a, A, F>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    type Item = Vec<(Box<[u8], A>, Box<[u8], A>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unimplemented!()
-
-        // if self.sub_iter.is_some() {
-        //     let sub_iter = self.sub_iter.as_mut().unwrap();
-
-        //     // TODO: Need to pass through key as (prefix, slot, suffix). This
-        //     // avoids copies.
-
-        //     let next = sub_iter.next();
-
-        //     if next.is_some() {
-        //         return next;
-        //     } else {
-        //         let iter = self.sub_iter.take().unwrap();
-        //         let next_key = iter.last_key.unwrap();
-
-        //         // HEAP ALLOC :(
-        //         let mut next_page_key = vec![0u8; next_key.len() + 1];
-        //         let mut c = 0;
-                
-        //         next_page_key[c..next_key.0.len()].copy_from_slice(next_key.0);
-        //         c += next_key.0.len();
-
-        //         next_page_key[c..c+next_key.1.len()].copy_from_slice(next_key.1);
-        //         c += next_key.1.len();
-
-        //         next_page_key[c..c+next_key.2.len()].copy_from_slice(next_key.2);
-        //         c += next_key.2.len();
-
-        //         self.lower_fence = next_page_key;
-        //     }
-        // }
-
-        // loop {
-        //     let page = match self.btree.search_to_leaf(&self.lower_fence, None) {
-        //         Ok(p) => p,
-        //         Err(SearchError::OptimisticConflict) => continue,
-        //     };
-
-        //     // let pre_version = match page.version() {
-        //     //     Ok(v) => v,
-        //     //     Err(_) => continue,
-        //     // };
-
-        //     // let range = &self.lower_fence[..]..self.range.end;
-
-        //     // let sub_iter = page.scan(range);
-        //     // page.read_lock();
-        //     // self.sub_iter = Some(sub_iter);
-
-        //     // let lock = page.read_lock();
-        //     // self.sub_iter = Some(page.scan(self.cursor));
-        //     // self.sub_iter_lock = lock;
-
-        //     todo!("need to implement page.scan")
-        // }
-
-        
-
-        // unimplemented!()
-    }
-}
-
-/*
-
-
-for page_iter in btree.scan(b"foo"..b"qux") {
-    let mut results = ...;
-
-    for (k, v) in page_iter {
-        results.push(...)
-    }
-
-    if page_iter.validate() {
-        // good to go! we can store the results
-
-        yeild results / push to outer results, etc
-    } else {
-        // next iteration will contain the same data
-        // We need to forget this iteration's results
-        std::mem::drop(results);
-    }
-
-    // if page_iter panics if validate() wasn't called before drop
-}
-
-
-
-btree
-    .scan(b"foo"..b"qux")
-    .
-
-
-
-*/
-
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchError {
-    OptimisticConflict
-}
-
-impl From<page::VersionLoadError> for SearchError {
-    fn from(e: page::VersionLoadError) -> Self {
-        match e {
-            page::VersionLoadError::Locked => SearchError::OptimisticConflict,
-            page::VersionLoadError::Unloaded => SearchError::OptimisticConflict
-        }
-    }
-}
-
-
-
-struct BTreeOptions {
-    file: PathBuf,
-    max_disk_size: usize,
-    max_buffer_pool_size: usize,
-    base_page_size: usize,
-
-    schema: Vec<ColumnDefinition>,
-}
-
-struct ColumnDefinition {
-    required: bool,
-    has_var_part: bool,
-    fixed_bits: usize,
-}
-
-fn foo() {
-    BTreeOptions {
-        file: "./foo.db".into(),
-        max_disk_size: n_mib_bytes!(64) as usize,
-        max_buffer_pool_size: n_mib_bytes!(16) as usize,
-        base_page_size: n_kib_bytes!(64) as usize,
-
-        schema: vec![
-            ColumnDefinition {
-                required: true,
-                has_var_part: false,
-                fixed_bits: 64,
-            },
-
-            ColumnDefinition {
-                required: true,
-                has_var_part: false,
-                fixed_bits: 32,
-            }
-        ]
-    };
-}
-
-
-struct Column<'a, T> {
-    data: &'a [u8],
-    marker: std::marker::PhantomData<T>
-}
-
-impl<'a, T> Column<'a, T, > {
-    fn collect_eq(&self, val: &[u8]) -> Vec<[u8; std::mem::size_of::<T>()]> {
-        let width = std::mem::size_of::<T>();
-        let num_chunks = self.data.len() / width;
-        let mut out = Vec::with_capacity(num_chunks);
-
-        for i in 0..num_chunks {
-            let source = &self.data[i*width..i*width+width];
-            if source == val {
-                let mut arr = [0u8; std::mem::size_of::<T>()];
-                arr.copy_from_slice(source);
-                out.push(arr);
-            }
+        if self.lower_fence.is_none() {
+            return None;
         }
 
-        out
-    }
+        let fence = self.lower_fence.take().unwrap();
+        let (node, _) = self.btree.search_to_leaf(&fence, LatchStrategy::Shared);
 
-    fn eq_bitmap(&self, val: &[u8]) -> [u64; 8] {
-        let width = std::mem::size_of::<T>();
-        let num_chunks = self.data.len() / width;
-
-        let mut out = [0u64; 8];
-
-
-        for i in 0..num_chunks {
-            let source = &self.data[i*width..i*width+width];
-            if source == val {
-                let out_idx = i / 64;
-                let bit_idx = i % 64;
-
-                out[out_idx] |= 1 << bit_idx;
-            }
+        let upper_fence = node.upper_fence();
+        if upper_fence.len() == 0 {
+            self.lower_fence = None;
+        } else {
+            self.lower_fence = Some(node.upper_fence().to_vec());
         }
 
-        out
+        Some(node.clone_key_values_until(
+            self.upper_bound.as_ref().map(|k| &k[..]),
+            &self.pred,
+            self.alloc.clone(),
+        ))
     }
 }
-
-#[inline]
-fn bitand_segment(left: &[u64; 8], right: &[u64; 8]) -> [u64; 8] {
-    let mut out = [0u64; 8];
-
-    for i in 0..8 {
-        out[i] = left[i] & right[i];
-    }
-
-    out
-}
-
-#[test]
-fn bar() {
-    let col1: Column<u8> = Column { data: b"hello world", marker: Default::default() };
-    let col2: Column<u8> = Column { data: b"spicy world", marker: Default::default() };
-    let res = col1.collect_eq(b"l");
-
-    eprintln!("Test out: {:?}", res);
-
-    let res = col1.eq_bitmap(b"l");
-    eprintln!("Test out: {:b}", res[0]);
-
-    let res2 = col2.eq_bitmap(b"l");
-    eprintln!("Test out: {:b}", res2[0]);
-
-    let bit = bitand_segment(&res, &res2);
-    eprintln!("Test out: {:b}", bit[0]);
-}
-
-// struct ColumnIterator {
-// }
-
-
-
-/*
-
-Root:
-[
-    swip to Root Inner
-    [Free list]
-]
-
-Inner:
-[
-    [page prefix]
-    [sorted(next 4 bytes of ids)]
-
-    [var length tail, swip]
-]
-
-Leaf:
-[
-    [sorted(id range), segment offset]
-
-    segment [
-        [mvcc versions]
-        [
-            [[null bitmap], col1],
-            [[null bitmap], col...],
-            [[null bitmap], coln]
-        ]
-    ]
-
-    [var length data]
-]
-
-*/
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::FakeDiskManager;
-    use crate::buffer_manager::BufferManager;
+    use std::time::Instant;
+
+    fn make_buffer_manager() -> BufferManager {
+        BufferManager::new(4096 * 4096 * 5000)
+    }
 
     #[test]
-    fn basic_operations() {
-        let disk_manager = Box::new(FakeDiskManager::default());
-        let max_memory = disk_manager.capacity();
-        let buffer_manager = BufferManager::new(disk_manager, max_memory);
-
-        let page = unsafe { buffer_manager.new_page().unwrap() };
-        let btree = BTree::bootstrap(&buffer_manager, (page.0.into(), page.1)).unwrap();
-
+    fn insert_get() {
+        let bm = make_buffer_manager();
+        let btree = BTree::new(&bm);
         btree.insert(b"foo", b"bar");
-        btree.insert(b"qux", b"zap");
-        btree.insert(b"foobar", b"zzz");
-        btree.insert(b"aaa", b"bbb");
+        assert_eq!(Some(b"bar".to_vec().into_boxed_slice()), btree.get(b"foo"));
+    }
 
-        let p0: Page = unsafe { buffer_manager.load_swizzled((0, 0).into()).into() };
-        let p1: Page = unsafe { buffer_manager.load_swizzled((1, 0).into()).into() };
+    #[test]
+    fn basic_range_query() {
+        let bm = make_buffer_manager();
 
-        eprintln!("p0: {:#?}", p0);
-        eprintln!("p1: {:#?}", p1);
+        let btree = BTree::new(&bm);
+        btree.insert(b"aaa", b"aaa");
+        btree.insert(b"bbb", b"bbb");
+        btree.insert(b"ccc", b"ccc");
+        btree.insert(b"ddd", b"ddd");
+        btree.insert(b"eee", b"eee");
+        btree.insert(b"fff", b"fff");
+
+        let range = btree.range(b"aaa", Some(b"d"), |_| true);
+        for chunk in range {
+            // println!("Chunk: {:?}", chunk);
+            for kv in chunk.iter() {
+                println!("KV: {:?}", kv);
+                // let k = &kv.0;
+                // let v = &kv.1;
+
+                // println!("k: {:?}", k[0]);
+            }
+        }
+    }
+
+    // #[test]
+    // fn node_split_big_values() {
+    //     let _ = env_logger::builder().is_test(true).try_init();
+    //     let bm = make_buffer_manager();
+
+    //     let btree = BTree::new(&bm);
+    //     btree.insert(b"foo", &[1u8; 1028 * 10]);
+    //     btree.insert(b"bar", &[2u8; 1028 * 10]);
+    //     btree.insert(b"mmm", &[3u8; 1028 * 10]);
+
+    //     assert_eq!(Some([1u8; 1028 * 10].to_vec()), btree.get(b"foo"));
+    //     assert_eq!(Some([2u8; 1028 * 10].to_vec()), btree.get(b"bar"));
+    //     assert_eq!(Some([3u8; 1028 * 10].to_vec()), btree.get(b"mmm"));
+    // }
+
+    #[test]
+    fn node_split_many_single_level() {
+        use rand::Rng;
+        use std::collections::HashMap;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let bm = make_buffer_manager();
+        let btree = BTree::new(&bm);
+
+        let mut hashmap = HashMap::new();
+
+        for _ in 0..10000 {
+            let key = rand::thread_rng().gen::<[u8; 32]>();
+            let value = rand::thread_rng().gen::<[u8; 32]>();
+
+            btree.insert(&key, &value);
+            hashmap.insert(key, value);
+        }
+
+        for (i, (k, v)) in hashmap.iter().enumerate() {
+            assert_eq!(
+                Some(v.to_vec().into_boxed_slice()),
+                btree.get(&k[..]),
+                "Failed on check {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn node_split_many_multi_level() {
+        use rand::Rng;
+        use std::collections::HashMap;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let bm = make_buffer_manager();
+        let btree = BTree::new(&bm);
+
+        let count = 10000000;
+
+        let mut hashmap = HashMap::with_capacity(count);
+        let mut vec = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let key = rand::thread_rng().gen::<[u8; 16]>();
+            let value = rand::thread_rng().gen::<[u8; 16]>();
+
+            vec.push((key, value));
+            hashmap.insert(key, value);
+        }
+
+        let start = Instant::now();
+
+        for (k, v) in &vec {
+            btree.insert(k, v);
+        }
+
+        let elapsed = start.elapsed().as_nanos();
+
+        println!("Insert completed in {}ms", elapsed / 1000000);
+        println!("Ops/s: {}", 1000000000 / (elapsed / count as u128));
+        println!("Checking results...");
+
+        for (i, (k, v)) in hashmap.iter().enumerate() {
+            if Some(v.to_vec().into_boxed_slice()) != btree.get(&k[..]) {
+                let (node, path) = btree.search_to_leaf(k, LatchStrategy::OptimisticSpin);
+
+                fn debug_fence_mismatch(node: &PageGuard<Node>) {
+                    let children = node.all_children();
+
+                    children.windows(2).for_each(|w| {
+                        let left = &w[0];
+                        let right = &w[1];
+
+                        if left.upper_fence() != right.lower_fence() {
+                            println!(
+                                "Fence mismatch:\nParent: {:?}\n    Left:   {:?}\n    Right:  {:?}",
+                                node, left, right
+                            );
+                        }
+                    });
+
+                    for child in children.iter() {
+                        if !child.is_leaf() {
+                            debug_fence_mismatch(child);
+                        }
+                    }
+                }
+
+                debug_fence_mismatch(path.first().unwrap());
+
+                panic!(
+                    "Failed on check {}\n\nKey: {:?}\n\nNode: {:?}\n\nPath: {:?}",
+                    i, k, node, path
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn threaded_split_many_multi_level() {
+        use rand::Rng;
+        use std::sync::Arc;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // let mut threads = vec![];
+        let bm = make_buffer_manager();
+        let btree = BTree::new(&bm);
+
+        let count = 10000000;
+        let thread_count = 4;
+
+        let mut kv_buckets = vec![];
+
+        for _ in 0..thread_count {
+            // let mut hashmap = HashMap::with_capacity(count);
+            let mut vec = Vec::with_capacity(count);
+
+            for _ in 0..count {
+                let key = rand::thread_rng().gen::<[u8; 16]>();
+                let value = rand::thread_rng().gen::<[u8; 16]>();
+                vec.push((key, value));
+                // hashmap.insert(key, value);
+            }
+
+            kv_buckets.push(vec);
+        }
+
+        let all_key_values: Vec<_> = kv_buckets.clone().into_iter().flatten().collect();
+
+        let start = Instant::now();
+
+        crossbeam::thread::scope(|s| {
+            for i in 0..thread_count {
+                let vec = kv_buckets[i].clone();
+                let inner_btree = btree.clone();
+                s.spawn(move |_| {
+                    let btree = inner_btree;
+
+                    for (k, v) in vec.into_iter() {
+                        btree.insert(&k, &v);
+                    }
+
+                    // for (_i, (k, v)) in hashmap.iter().enumerate() {
+                    //     assert_eq!(Some(v.to_vec()), btree.get(&k[..]).unwrap());
+                    // }
+                });
+            }
+        })
+        .unwrap();
+
+        let elapsed = start.elapsed().as_nanos();
+
+        println!("Insert completed in {}ms", elapsed / 1000000);
+        println!(
+            "Ops/s: {}",
+            1000000000 / (elapsed / (count * thread_count) as u128)
+        );
+
+        // all_key_values
+        use rand::distributions::{Distribution, Uniform};
+
+        let kvs = Arc::new(all_key_values);
+        // let mut threads = vec![];
+        let thread_count = thread_count * 2;
+
+        let start = Instant::now();
+
+        crossbeam::thread::scope(|s| {
+            for _ in 0..thread_count {
+                let inner_kvs = kvs.clone();
+                let inner_btree = btree.clone();
+
+                s.spawn(move |_| {
+                    let kvs = inner_kvs;
+                    let btree = inner_btree;
+
+                    let mut rng = rand::thread_rng();
+                    let die = Uniform::from(0..kvs.len());
+
+                    for _ in 0..count {
+                        let idx = die.sample(&mut rng);
+                        btree.get(&kvs[idx].0).unwrap();
+                    }
+                });
+            }
+        })
+        .unwrap();
+
+        let elapsed = start.elapsed().as_nanos();
+
+        println!("Read completed in {}ms", elapsed / 1000000);
+        println!(
+            "Ops/s: {}",
+            1000000000 / (elapsed / (count * thread_count) as u128)
+        );
     }
 }

@@ -3,5 +3,5 @@
 #![feature(new_uninit)]
 #![feature(allocator_api)]
 
-pub mod btree2;
+pub mod btree;
 pub mod buffer_manager;
