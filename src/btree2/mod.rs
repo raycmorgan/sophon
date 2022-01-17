@@ -82,7 +82,7 @@ impl<'a> BTree<'a> {
             };
 
             if path.len() == 0 {
-                println!("SPLIT ROOT #1");
+                debug!("SPLIT ROOT #1");
 
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                 let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
@@ -135,7 +135,7 @@ impl<'a> BTree<'a> {
                 } else if parents == path_len {
                     // we need to split the root!
 
-                    println!("SPLIT ROOT #2");
+                    debug!("SPLIT ROOT #2");
 
                     let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                     let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
