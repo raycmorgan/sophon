@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, trace};
 use std::{
     alloc::Allocator,
     fmt::Debug,
@@ -223,11 +223,17 @@ impl Node {
         let data_len = key_parts.1.len() + value.len();
 
         if data_len + size_of::<Slot>() > self.available_space() {
-            // println!("data_len: {}, key_parts.1.len(): {}, _of::<Slot>(): {}, self.available_space(): {}, active_space: {}",
-            // data_len, key_parts.1.len(), size_of::<Slot>(), self.available_space(), self.header.space_active);
+            if data_len + size_of::<Slot>() < self.available_space() + self.dead_space() {
+                // We have the available data to insert this key, we just need to
+                // first compact the node's data.
+                trace!("Compacting during insert: {:?}", self);
 
-            // TODO: Check to see if we can compact to prevent a split
-            return Err(InsertError::InsufficientSpace);
+                let mut tmp_buffer = [0u8; MAX_KEY_LEN];
+                self.compact(&mut tmp_buffer, None);
+            } else {
+                // We don't have enough space, need to split the node to fit data.
+                return Err(InsertError::InsufficientSpace);
+            }
         }
 
         let data_ptr = self.data().len() - self.header.space_used as usize - data_len;
@@ -242,7 +248,9 @@ impl Node {
 
         let pos = match self.search(&key_parts) {
             Ok(pos) => {
-                // todo: recapture prior active space as this is an update
+                let slot = self.slots()[pos];
+                self.header.space_active -= slot.data_len + slot.key_len as u32 - SLOT_KEY_LEN as u32;
+
                 pos
             }
             Err(pos) => {
@@ -790,6 +798,11 @@ impl Node {
     }
 
     #[inline]
+    fn dead_space(&self) -> usize {
+        (self.header.space_used - self.header.space_active) as usize
+    }
+
+    #[inline]
     fn prefix(&self) -> &[u8] {
         let data = self.data();
         &data[data.len() - self.header.prefix_len as usize..data.len()]
@@ -878,10 +891,8 @@ impl Debug for Node {
             .field("lower_fence", &lower_fence)
             .field("upper_fence", &upper_fence)
             .field("prefix", &self.prefix())
-            .field(
-                "available_space",
-                &(self.header.data_capacity as usize - self.header.space_used as usize),
-            )
+            .field("available_space", &self.available_space())
+            .field("dead_space", &self.dead_space())
             .finish()
     }
 }

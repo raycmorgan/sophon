@@ -1,7 +1,6 @@
 ## Must do
 * [] Deletion
     * [] Node merges
-    * [] Compaction on insert
 * [] Large values (overflow pages or large pages)
 * [] Duplicate keys
 * [] Persistence
