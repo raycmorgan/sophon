@@ -127,11 +127,9 @@ impl Node {
         self.header.db_version = db_version;
         self.header.height = height;
         self.header.pid = pid;
-        // self.header.upper_swip = upper_swip;
         self.header.is_leaf = is_leaf;
         self.header.slot_count = 0;
         self.header.prefix_len = prefix.len().try_into().unwrap();
-        // self.header.data_capacity = DATA_CAPACITY as u32;
 
         debug_assert!(self.header.data_capacity != 0);
 
@@ -181,12 +179,6 @@ impl Node {
 
         node.set_backing_len(PAGE_SIZE);
         node
-
-        // Node {
-        //     header: NodeHeader::default(),
-        //     // contents: NodeContents { data: [0u8; SLOTS_CAPACITY * size_of::<Slot>()] },
-        //     contents: NodeContents { data: [] },
-        // }
     }
 
     #[inline]
@@ -223,9 +215,14 @@ impl Node {
         let data_len = key_parts.1.len() + value.len();
 
         if data_len + size_of::<Slot>() > self.available_space() {
-            if data_len + size_of::<Slot>() < self.available_space() + self.dead_space() {
-                // We have the available data to insert this key, we just need to
-                // first compact the node's data.
+            let after_compact = self.available_space() + self.dead_space();
+            let utilization = after_compact as f32 / self.header.data_capacity as f32;
+
+            // We want to compact instead of split when doing so drops us under
+            // an appropriate used space threshold and the data will fit.
+            // The threshold is here to ensure we don't continually compact nodes
+            // nearing 100% utilization -- we'd rather just split in that case.
+            if utilization < 0.7 && data_len + size_of::<Slot>() < after_compact {
                 trace!("Compacting during insert: {:?}", self);
 
                 let mut tmp_buffer = [0u8; MAX_KEY_LEN];
@@ -258,7 +255,6 @@ impl Node {
 
                 if pos < slot_count {
                     unsafe {
-                        // self.contents.slots.copy_within(pos..slot_count, pos + 1);
                         self.slots_mut_unbounded()
                             .copy_within(pos..slot_count, pos + 1);
                     }
@@ -273,7 +269,6 @@ impl Node {
             let mut k = [0u8; SLOT_KEY_LEN];
             k[0..key_parts.0.len()].copy_from_slice(&key_parts.0[0..]);
 
-            // self.contents.slots[pos] = Slot {
             self.slots_mut_unbounded()[pos] = Slot {
                 key: k,
                 data_ptr: data_ptr as u32,
