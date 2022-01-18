@@ -560,16 +560,6 @@ impl Node {
         right: &mut PageGuard<Node>,
         pivot: usize,
     ) {
-        // let key = &pivot_key[self.header.prefix_len as usize..];
-        // let key_parts = key_parts(&key);
-        // let pivot = self.search(&key_parts).unwrap_or_else(|i| i);
-
-        // reinsert all slots >= pivot into right
-        // update self.slot_count to remove tail slots >= pivot
-        // compact self
-
-        // debug!("Splitting root. Slot Count: {}, Pivot: {:?}", self.slots().len(), pivot_key);
-
         let mut temp = [0u8; MAX_KEY_LEN];
 
         let l_pid = left.pid();
@@ -577,10 +567,6 @@ impl Node {
 
         let pivot_slot = self.slots()[pivot];
         let split_key = self.copy_key(pivot_slot, &mut temp);
-
-        // [a, b, d, e, t].z;
-        // [a, b, d] [e, t, z]
-        // [a, b].d  [e, t].z
 
         left.init_header(
             1,
@@ -637,14 +623,9 @@ impl Node {
 
         // insert left and right
         debug_assert!(left.lower_fence() < right.lower_fence());
-        // self.insert(left.lower_fence(), &left.swip_bytes()).expect("infallible");
-        // self.insert(right.lower_fence(), &right.swip_bytes()).expect("infallible");
 
         self.insert_inner(left).expect("infallible");
         self.insert_inner(right).expect("infallible");
-
-        // println!("Parent, header.upper_swip: {:?}", self.header.upper_swip);
-        // debug!("Parent, insert: {:?}", pivot_key);
 
         debug_assert_eq!(left.upper_fence(), right.lower_fence());
 
@@ -983,5 +964,10 @@ mod tests {
 
         node.delete(b"foo");
         assert_eq!(None, node.get(b"foo"));
+    }
+
+    #[test]
+    fn compact_on_insert() {
+        // TODO: test both above and below utilization threshold
     }
 }
