@@ -173,7 +173,8 @@ impl Node {
 
     #[cfg(test)]
     fn testable() -> Box<Node> {
-        use crate::buffer_manager::buffer_frame::PAGE_SIZE;
+        const PAGE_SIZE: usize = 1024 * 16;
+
         let mem = Box::new([0u8; PAGE_SIZE]);
         let mut node: Box<Node> = unsafe { std::mem::transmute(mem) };
 

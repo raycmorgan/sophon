@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, mem::size_of};
 
-use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED, PAGE_SIZE};
+use self::buffer_frame::{BufferFrame, PageGuard, PAGE_DATA_RESERVED};
 
 pub(crate) mod buffer_frame;
 pub(crate) mod swip;
@@ -29,9 +29,41 @@ pub enum AllocError {
     OutOfSpace,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Builder {
+    max_memory: usize,
+    base_page_size: usize,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        const PAGE_SIZE: usize = 1024 * 16;
+
+        Builder {
+            max_memory: 0,
+            base_page_size: PAGE_SIZE,
+        }
+    }
+
+    pub fn max_memory(mut self, val: usize) -> Self {
+        self.max_memory = val;
+        self
+    }
+
+    pub fn base_page_size(mut self, val: usize) -> Self {
+        self.base_page_size = val;
+        self
+    }
+
+    pub fn build(self) -> BufferManager {
+        BufferManager::from_builder(self)
+    }
+}
+
 impl BufferManager {
-    pub fn new(max_memory: usize) -> Self {
-        let base_page_size = PAGE_SIZE;
+    fn from_builder(builder: Builder) -> Self {
+        let max_memory = builder.max_memory;
+        let base_page_size = builder.base_page_size;
         let mut page_classes = Vec::new();
 
         let mut class_size = base_page_size;

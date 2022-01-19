@@ -459,11 +459,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::buffer_manager;
+
     use super::*;
     use std::time::Instant;
 
     fn make_buffer_manager() -> BufferManager {
-        BufferManager::new(4096 * 4096 * 5000)
+        buffer_manager::Builder::new()
+            .max_memory(4096 * 4096 * 5000)
+            .build()
     }
 
     #[test]

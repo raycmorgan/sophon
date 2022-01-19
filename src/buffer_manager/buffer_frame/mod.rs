@@ -10,8 +10,7 @@ use std::{
 mod page_guard;
 
 pub(crate) use page_guard::{LatchStrategy, PageGuard};
-pub(crate) const PAGE_SIZE: usize = 1024 * 16;
-pub(crate) const PAGE_DATA_RESERVED: usize = size_of::<u64>();
+pub(crate) const PAGE_DATA_RESERVED: usize = size_of::<PageHeader>();
 
 struct Header {
     version: AtomicU64,
@@ -77,9 +76,13 @@ impl<'a> BufferFrame<'a> {
     }
 }
 
+pub(crate) struct PageHeader {
+    _gsn: u64,
+}
+
 #[repr(C)]
 pub(crate) struct Page {
-    gsn: u64,
+    header: PageHeader,
     // Placeholder -- real len in noted self contained inside data,
     // it is at least large enough to know its own length
     data: [u8; 0], // [u8; USABLE_PAGE_SIZE],
