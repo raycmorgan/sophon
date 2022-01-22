@@ -183,6 +183,20 @@ impl Node {
     }
 
     #[inline]
+    pub(crate) fn capacity_with(&self, key: &[u8], value: &[u8]) -> usize {
+        size_of::<NodeHeader>()
+            + self.used_space()
+            + size_of::<Slot>()
+            + key.len().saturating_sub(SLOT_KEY_LEN)
+            + value.len()
+    }
+
+    #[inline]
+    pub(crate) fn data_capacity(&self) -> usize {
+        self.header.data_capacity as usize
+    }
+
+    #[inline]
     pub(crate) fn insert_inner(&mut self, child: &PageGuard<Node>) -> Result<(), InsertError> {
         debug_assert!(self.contains(child));
         self.insert(child.lower_fence(), &child.swip_bytes())
@@ -505,8 +519,6 @@ impl Node {
 
     #[inline]
     fn compact(&mut self, tmp_buffer: &mut [u8], upper_fence: Option<&[u8]>) {
-        // let tmp = [0u8; DATA_CAPACITY];
-
         let mut tmp: &mut Node = unsafe {
             let mut backing: Box<[std::mem::MaybeUninit<u8>]> =
                 Box::new_zeroed_slice(size_of::<Node>() + self.header.data_capacity as usize);
@@ -540,6 +552,26 @@ impl Node {
         self.header.prefix_len = tmp.header.prefix_len;
         self.header.space_active = tmp.header.space_active;
         self.header.space_used = tmp.header.space_used;
+    }
+    
+    #[inline]
+    pub(crate) fn clone_to(&self, other: &mut Node) {
+        other.init_header(
+            self.header.db_version,
+            self.header.pid,
+            self.header.height,
+            self.header.is_leaf,
+            self.lower_fence(),
+            self.upper_fence()
+        );
+
+        let tmp_buffer = &mut [0u8; MAX_KEY_LEN];
+
+        for slot in self.slots() {
+            let key = self.copy_key(*slot, tmp_buffer);
+            let value = self.get_data_value(*slot);
+            other.insert(key, value).expect("infallible");
+        }
     }
 
     #[inline]
@@ -754,6 +786,17 @@ impl Node {
                 self.header.slot_count as usize,
             )
         }
+    }
+
+    #[inline]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.header.slot_count as usize
+    }
+
+    #[inline]
+    pub(crate) fn used_space(&self) -> usize {
+        self.entry_count() * size_of::<Slot>()
+            + self.header.space_active as usize
     }
 
     /// Safety: This returns a slice of Slots with the len being equal

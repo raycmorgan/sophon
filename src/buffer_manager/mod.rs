@@ -97,12 +97,20 @@ impl BufferManager {
     }
 
     pub(crate) fn new_page<T: Swipable>(&self) -> Result<Swip<T>, AllocError> {
+        self.new_page_with_capacity(1)
+    }
+
+    pub(crate) fn new_page_with_capacity<T: Swipable>(&self, capacity: usize) -> Result<Swip<T>, AllocError> {
         // Simple bump allocation of pages
         // TODO: implement reuse after free
         let page_id = self.page_counter.fetch_add(1, Ordering::SeqCst);
 
+        let page_class = self.page_classes.iter().find(|pc| {
+            capacity <= pc.page_size
+        }).expect("no PageClass for capacity");
+
         let page: &mut buffer_frame::Page =
-            unsafe { std::mem::transmute(self.page_classes[0].get_page(page_id).as_ptr()) };
+            unsafe { std::mem::transmute(page_class.get_page(page_id).as_ptr()) };
 
         // TODO: assert within range
         let bf = unsafe {
@@ -122,7 +130,7 @@ impl BufferManager {
         let swip = Swip::new(bf as usize);
 
         let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
-        guard.set_backing_len(self.page_classes[0].page_size - PAGE_DATA_RESERVED);
+        guard.set_backing_len(page_class.page_size - PAGE_DATA_RESERVED);
         std::mem::drop(guard);
 
         Ok(swip)

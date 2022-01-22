@@ -15,6 +15,8 @@ use self::node::Node;
 
 mod node;
 
+const HEURISTIC_RESIZE_THRESHOLD: usize = 6;
+
 // The size of this stack limits the depth that a tree can become.
 // We need to statically hold this max depth to avoid heap allocations.
 // 32 should be more than plenty.
@@ -42,6 +44,13 @@ type GuardPath = StackVec<[PageGuard<Node>; 32]>;
 pub struct BTree<'a> {
     buffer_manager: &'a BufferManager,
     root_page: Swip<Node>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum InsertInfo {
+    SplitRoot(u64),
+    SplitPage(u64),
+    ResizedPage(u64)
 }
 
 impl<'a> BTree<'a> {
@@ -80,8 +89,9 @@ impl<'a> BTree<'a> {
     /// 1. It may compact nodes to fit the key-value pair
     /// 2. It may split nodes to fit the key-value pair
     /// 3. [once disk backed] It may require loading nodes from disk
-    pub fn insert(&self, key: &[u8], value: &[u8]) {
+    pub fn insert(&self, key: &[u8], value: &[u8]) -> StackVec<[InsertInfo; 32]> {
         'outer: loop {
+            let mut info: StackVec<[InsertInfo; 32]> = StackVec::default();
             let (mut node, mut path) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
 
             #[cfg(debug_assertions)]
@@ -123,9 +133,14 @@ impl<'a> BTree<'a> {
             }
 
             match node.insert(&key, &value) {
-                Ok(()) => return,
+                Ok(()) => {
+                    return info;
+                },
                 Err(node::InsertError::InsufficientSpace) => (),
             };
+
+            // We don't have enough space in the node, and therefore need to perform a
+            // split or resize.
 
             if path.len() == 0 {
                 debug!("SPLIT ROOT #1");
@@ -152,7 +167,8 @@ impl<'a> BTree<'a> {
                     right.insert(key, value).expect("Space to now exist");
                 }
 
-                return;
+                info.try_push(InsertInfo::SplitRoot(node.pid())).expect("infallible");
+                return info;
             }
 
             // We need to split the page, start by locking parents until we either
@@ -198,6 +214,7 @@ impl<'a> BTree<'a> {
                         .expect("infallible");
 
                     parent.root_split(&mut left, &mut right, pivot);
+                    info.try_push(InsertInfo::SplitRoot(parent.pid())).expect("infallible");
 
                     let s = node
                         .get_next(&key)
@@ -222,8 +239,6 @@ impl<'a> BTree<'a> {
             // At this point we hold exclusive locks from the leaf up to a parent
             // that can hold a new swip, or the entire path, which means root node.
 
-            let mut right_guard = None;
-
             for i in path_len - parents..path_len {
                 let parts = path.split_at_mut(i + 1);
                 let parent = parts.0.last().expect("infallible");
@@ -237,13 +252,32 @@ impl<'a> BTree<'a> {
                 let left = parts.1.first_mut().unwrap_or(&mut node);
                 let (pivot, klen, vlen) = left.pivot_for_split();
 
+                if left.is_leaf() && left.entry_count() < HEURISTIC_RESIZE_THRESHOLD {
+                    // Instead of splitting, in this case we will resize the node
+                    let required_space = node.capacity_with(key, value);
+                    let new_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(required_space).unwrap();
+
+                    let mut new_node = new_swip
+                        .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
+                        .expect("infallible");
+
+                    node.clone_to(&mut new_node);
+                    new_node.insert(key, value).expect("Space to now exist");
+                    // TODO: release node
+                    parent.insert_inner(&new_node).expect("infallible");
+                    info.try_push(InsertInfo::ResizedPage(new_node.pid())).expect("infallible");
+
+                    return info;
+                }
+
                 // TODO(safety): handle error
-                let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
+                let right_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(left.data_capacity()).unwrap();
                 let mut right = right_swip
                     .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
                     .expect("infallible");
 
                 left.split(&mut right, pivot);
+                info.try_push(InsertInfo::SplitPage(left.pid())).expect("infallible");
 
                 debug_assert!(parent.shares_prefix(right.lower_fence()));
                 debug_assert!(
@@ -267,22 +301,21 @@ impl<'a> BTree<'a> {
 
                 if !left.is_leaf() && key >= left.upper_fence() {
                     path[i + 1] = right;
-                } else {
-                    right_guard = Some(right);
+                } else if left.is_leaf() {
+                    if key < left.upper_fence() {
+                        debug_assert!(left.shares_prefix(key));
+                        left.insert(key, value).expect("Space to now exist");
+                    } else {
+                        debug_assert!(right.shares_prefix(key));
+                        debug_assert!(key >= right.lower_fence());
+                        right.insert(key, value).expect("Space to now exist");
+                    }
+
+                    return info;
                 }
             }
 
-            if key < node.upper_fence() {
-                debug_assert!(node.shares_prefix(key));
-                node.insert(key, value).expect("Space to now exist");
-            } else {
-                let mut right = right_guard.expect("infallible");
-                debug_assert!(right.shares_prefix(key));
-                debug_assert!(key >= right.lower_fence());
-                right.insert(key, value).expect("Space to now exist");
-            }
-
-            return;
+            unreachable!();
         }
     }
 
@@ -462,7 +495,7 @@ mod tests {
     use crate::buffer_manager;
 
     use super::*;
-    use std::time::Instant;
+    use std::{time::Instant, assert_matches::assert_matches};
 
     fn make_buffer_manager() -> BufferManager {
         buffer_manager::Builder::new()
@@ -546,6 +579,77 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn grow_page() {
+        let bm = buffer_manager::Builder::new()
+            .max_memory(4096 * 4096 * 5000)
+            .base_page_size(2048)
+            .build();
+
+        let btree = BTree::new(&bm);
+
+        const VLEN: usize = 2048 / HEURISTIC_RESIZE_THRESHOLD;
+        let kvs = [
+            (b"aaa", [1u8; VLEN]),
+            (b"bbb", [2u8; VLEN]),
+            (b"ccc", [3u8; VLEN]),
+            (b"ddd", [4u8; VLEN]),
+            (b"eee", [5u8; VLEN]),
+        ];
+
+        for (k, v) in kvs.iter() {
+            assert_eq!(0, btree.insert(&k[..], &v[..]).len());
+        }
+
+        // Force the initial root split, we never expect the root to be resized
+        let res = btree.insert(b"fff", &[6u8; VLEN]);
+        assert_eq!(1, res.len());
+        assert_matches!(res[0], InsertInfo::SplitRoot(_));
+
+        let kvs = [
+            (b"baa", [11u8; VLEN]),
+            (b"bab", [12u8; VLEN]),
+            (b"bac", [13u8; VLEN]),
+        ];
+
+        for (k, v) in kvs.iter() {
+            let res = btree.insert(&k[..], &v[..]);
+            assert_eq!(0, res.len(), "Got {:?} inserting: {:?}", res, &k[..]);
+        }
+
+        // This node took 2 from the prior split, therefore the 4th insert
+        // should cause a resize, since there are only 5 keys in the node
+        let res = btree.insert(b"bad", &[14u8; VLEN]);
+        assert_eq!(1, res.len());
+        assert_matches!(res[0], InsertInfo::ResizedPage(_));
+
+        assert_eq!(
+            Some(vec![14u8; VLEN].into_boxed_slice()),
+            btree.get(b"bad")
+        );
+
+        // Let's now force this resized node to split and insert to the right
+        // to ensure it is of appropriate size.
+        let kvs = [
+            (b"bada", [21u8; VLEN]),
+            (b"badb", [22u8; VLEN]),
+            (b"babc", [23u8; VLEN]),
+            (b"babd", [24u8; VLEN]),
+            (b"babe", [25u8; VLEN]),
+        ];
+
+        for (k, v) in kvs.iter() {
+            let res = btree.insert(&k[..], &v[..]);
+            assert_eq!(0, res.len(), "Got {:?} inserting: {:?}", res, &k[..]);
+        }
+
+        // This node took 2 from the prior split, therefore the 4th insert
+        // should cause a resize, since there are only 5 keys in the node
+        let res = btree.insert(b"babf", &[26u8; VLEN]);
+        assert_eq!(1, res.len());
+        assert_matches!(res[0], InsertInfo::SplitPage(_));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 * [] Deletion
     * [] Node merges
 * [] Large values (overflow pages or large pages)
+    * [x] Heuristic for growing nodes
+    * [] Shrink nodes (as part of delete / node merge algorithm)
 * [] Duplicate keys
 * [] Persistence
     * [] Logging / Checkpointing
