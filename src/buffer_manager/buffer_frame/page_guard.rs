@@ -259,6 +259,7 @@ impl<T: Swipable> Deref for PageGuard<T> {
 
 impl<T: Swipable> DerefMut for PageGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        debug_assert!(self.state == LockState::Exclusive);
         self.data_structure_mut()
     }
 }

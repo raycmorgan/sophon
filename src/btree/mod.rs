@@ -319,6 +319,13 @@ impl<'a> BTree<'a> {
         }
     }
 
+    pub fn delete(&self, key: &[u8]) -> bool {
+        let (mut node, _) = self.search_to_leaf(&key, LatchStrategy::Exclusive);
+        node.delete(key)
+
+        // TODO: merge low capacity nodes
+    }
+
     /// Looks up a value that matches the provided key in the `BTree`,
     /// returning a copy of the value if found, else returns `None`.
     ///
@@ -509,6 +516,16 @@ mod tests {
         let btree = BTree::new(&bm);
         btree.insert(b"foo", b"bar");
         assert_eq!(Some(b"bar".to_vec().into_boxed_slice()), btree.get(b"foo"));
+    }
+
+    #[test]
+    fn delete() {
+        let bm = make_buffer_manager();
+        let btree = BTree::new(&bm);
+        btree.insert(b"foo", b"bar");
+        assert_eq!(Some(b"bar".to_vec().into_boxed_slice()), btree.get(b"foo"));
+        assert!(btree.delete(b"foo"));
+        assert_eq!(None, btree.get(b"foo"));
     }
 
     #[test]

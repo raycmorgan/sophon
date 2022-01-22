@@ -328,8 +328,7 @@ impl Node {
         Some(self.get_data_value(slot))
     }
 
-    #[allow(unused)]
-    pub(crate) fn delete(&mut self, key: &[u8]) {
+    pub(crate) fn delete(&mut self, key: &[u8]) -> bool {
         debug_assert!(key.len() < MAX_KEY_LEN);
         debug_assert!(&key[..self.header.prefix_len as usize] == self.prefix());
 
@@ -347,6 +346,9 @@ impl Node {
             }
 
             self.header.slot_count -= 1;
+            true
+        } else {
+            false
         }
     }
 
