@@ -248,24 +248,26 @@ impl Node {
             }
         }
 
-        let data_ptr = self.data().len() - self.header.space_used as usize - data_len;
-
+        let data_ptr = self.data_ptr() - data_len;
         let value_ptr = data_ptr + key_parts.1.len();
 
         self.data_mut()[data_ptr..data_ptr + key_parts.1.len()].copy_from_slice(&key_parts.1);
         self.data_mut()[value_ptr..value_ptr + value.len()].copy_from_slice(&value);
 
-        self.header.space_used += data_len as u32;
-        self.header.space_active += data_len as u32;
-
         let pos = match self.search(&key_parts) {
             Ok(pos) => {
                 let slot = self.slots()[pos];
-                self.header.space_active -= slot.data_len + slot.key_len as u32 - SLOT_KEY_LEN as u32;
+
+                self.header.space_used += data_len as u32;
+                self.header.space_active += data_len as u32;
+                self.header.space_active -= slot.data_len + slot.key_len.saturating_sub(SLOT_KEY_LEN as u16) as u32;
 
                 pos
             }
             Err(pos) => {
+                self.header.space_used += data_len as u32 + size_of::<Slot>() as u32;
+                self.header.space_active += data_len as u32 + size_of::<Slot>() as u32;
+
                 let slot_count = self.header.slot_count as usize;
 
                 if pos < slot_count {
@@ -334,7 +336,7 @@ impl Node {
 
         if let Ok(i) = self.search(&key_parts(&key)) {
             let slot = self.slots()[i];
-            self.header.space_active -= slot.data_len + slot.key_len as u32 - SLOT_KEY_LEN as u32;
+            self.header.space_active -= slot.data_len + slot.key_len.saturating_sub(SLOT_KEY_LEN as u16) as u32;
 
             let slot_count = self.header.slot_count as usize;
 
@@ -797,8 +799,14 @@ impl Node {
 
     #[inline]
     pub(crate) fn used_space(&self) -> usize {
-        self.entry_count() * size_of::<Slot>()
-            + self.header.space_active as usize
+        self.header.space_active as usize
+    }
+
+    #[inline]
+    fn data_ptr(&self) -> usize {
+        self.data().len()
+            - self.used_space()
+            + self.header.slot_count as usize * size_of::<Slot>()
     }
 
     /// Safety: This returns a slice of Slots with the len being equal
@@ -815,7 +823,6 @@ impl Node {
     #[inline]
     fn available_space(&self) -> usize {
         self.header.data_capacity as usize
-            - self.header.slot_count as usize * size_of::<Slot>()
             - self.header.space_used as usize
     }
 
@@ -915,6 +922,7 @@ impl Debug for Node {
             .field("prefix", &self.prefix())
             .field("available_space", &self.available_space())
             .field("dead_space", &self.dead_space())
+            // .field("slots", &self.slots())
             .finish()
     }
 }

@@ -5,6 +5,8 @@
     * [] Node merges
 * [] Large values (overflow pages or large pages)
     * [x] Heuristic for growing nodes
+    * [] Splitting insert is large value (root)
+    * [] Splitting insert is large value (non-root)
     * [] Shrink nodes (as part of delete / node merge algorithm)
 * [] Range queries
 * [] Duplicate keys
