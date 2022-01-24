@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1", optional = true, features = ["derive"] }
 libfuzzer-sys = { version = "0.4.0", features = ["arbitrary-derive"] }
+rand = { version = "0.8", features = ["min_const_gen", "small_rng"] }
 
 [dependencies.sophon]
 path = ".."
@@ -22,5 +23,11 @@ members = ["."]
 [[bin]]
 name = "fuzz_target_1"
 path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "large_trees"
+path = "fuzz_targets/large_trees.rs"
 test = false
 doc = false

@@ -2,7 +2,7 @@ use log::{debug, trace};
 use std::{
     alloc::Allocator,
     fmt::Debug,
-    mem::size_of,
+    mem::{size_of, ManuallyDrop},
     ops::{Deref, Range},
 };
 
@@ -523,11 +523,20 @@ impl Node {
 
     #[inline]
     fn compact(&mut self, tmp_buffer: &mut [u8], upper_fence: Option<&[u8]>) {
-        let mut tmp: &mut Node = unsafe {
-            let mut backing: Box<[std::mem::MaybeUninit<u8>]> =
-                Box::new_zeroed_slice(size_of::<Node>() + self.header.data_capacity as usize);
-            std::mem::transmute(backing.as_mut_ptr())
-        };
+        let mut backing: ManuallyDrop<Box<[std::mem::MaybeUninit<u8>]>> = 
+            ManuallyDrop::new(
+                Box::new_zeroed_slice(size_of::<Node>() + self.header.data_capacity as usize)
+            );
+
+        let mut tmp: &mut Node = unsafe { std::mem::transmute(backing.as_mut_ptr()) };
+
+        // let mut tmp: &mut Node = unsafe {
+        //     let mut backing: Box<[std::mem::MaybeUninit<u8>]> =
+        //         Box::new_zeroed_slice(size_of::<Node>() + self.header.data_capacity as usize);
+        //     let p = std::mem::transmute(backing.as_mut_ptr());
+        //     std::mem::forget(backing);
+        //     p
+        // };
 
         tmp.header.data_capacity = self.header.data_capacity;
 
@@ -543,7 +552,7 @@ impl Node {
 
         for slot in self.slots() {
             let key = self.copy_key(*slot, tmp_buffer);
-            debug_assert!(key < tmp.upper_fence(), "{:?}", tmp);
+            debug_assert!(tmp.upper_fence() == &[] || key < tmp.upper_fence(), "{:?}", tmp);
             let value = self.get_data_value(*slot);
             tmp.insert(key, value).expect("infallible");
         }
@@ -556,6 +565,8 @@ impl Node {
         self.header.prefix_len = tmp.header.prefix_len;
         self.header.space_active = tmp.header.space_active;
         self.header.space_used = tmp.header.space_used;
+
+        ManuallyDrop::into_inner(backing);
     }
     
     #[inline]

@@ -222,23 +222,27 @@ impl<'a> BTree<'a> {
                     parent.root_split(&mut left, &mut right, pivot);
                     info.try_push(InsertInfo::SplitRoot(parent.pid())).expect("infallible");
 
-                    let s = node
-                        .get_next(&key)
-                        .expect("All inner nodes should return _something_");
+                    // TODO(perf): restarting works, but is inefficient as we need to redo all
+                    // of our locks
+                    continue 'restart;
 
-                    let n = if s == left.swip_bytes() {
-                        right.downgrade();
-                        left
-                    } else {
-                        left.downgrade();
-                        right
-                    };
+                    // let s = node
+                    //     .get_next(&key)
+                    //     .expect("All inner nodes should return _something_");
 
-                    parent.downgrade();
-                    let _ = path.pop();
-                    path.try_push(n).expect("infallible");
+                    // let n = if s == left.swip_bytes() {
+                    //     right.downgrade();
+                    //     left
+                    // } else {
+                    //     left.downgrade();
+                    //     right
+                    // };
 
-                    break;
+                    // parent.downgrade();
+                    // let _ = path.pop();
+                    // path.try_push(n).expect("infallible");
+
+                    // break;
                 }
             }
 
@@ -251,8 +255,8 @@ impl<'a> BTree<'a> {
                 let left = parts.1.first().unwrap_or(&node);
 
                 debug_assert!(parent.contains(left),
-                    "Mismatched fences between parent and child.\nKey: {:?}\nParent: {:?}\nLeft: {:?}\n\nPath: {:?}\nNode:{:?}",
-                    key, parent, left, parts, node);
+                    "Mismatched fences between parent and child.\nKey: {:?}\nParent: {:?}\nLeft: {:?}\n\nPath: {:?}\nNode:{:?}\nInfo: {:?}",
+                    key, parent, left, parts, node, info);
 
                 let parent = parts.0.last_mut().expect("infallible");
                 let left = parts.1.first_mut().unwrap_or(&mut node);
@@ -280,10 +284,10 @@ impl<'a> BTree<'a> {
                 left.split(&mut right, pivot);
                 info.try_push(InsertInfo::SplitPage(left.pid())).expect("infallible");
 
-                if !left.is_leaf() {
-                    parent.insert_inner(&right).expect("infallible");
-                    parent.downgrade();
+                parent.insert_inner(&right).expect("infallible");
+                parent.downgrade();
 
+                if !left.is_leaf() {
                     if key >= left.upper_fence() {
                         path[i + 1] = right;
                     }
@@ -291,27 +295,8 @@ impl<'a> BTree<'a> {
                     continue;
                 } else {
                     if key < left.upper_fence() {
-                        parent.insert_inner(&right).expect("infallible");
-                        parent.downgrade();
-
-                        match left.insert(key, value) {
-                            Ok(()) => return info,
-                            Err(node::InsertError::InsufficientSpace) => {
-                                // We just split the node, but still don't have enough space
-                                // due to the k/v likely being too large.
-                                // Restarting will solve this by continually splitting the
-                                // node until it a) has space, or b) has a small enough
-                                // number of keys to cause a resize.
-                                // This is lazy, but we can't just assume the parent has space
-                                // to re-insert the k/v
-                                continue 'restart;
-                            }
-                        }
+                        left.insert(key, value).unwrap();
                     } else {
-
-                        parent.insert_inner(&right).expect("infallible");
-                        parent.downgrade();
-                        // &mut right
                         right.insert(key, value).unwrap();
                     }
 
