@@ -256,7 +256,7 @@ impl<'a> BTree<'a> {
 
                 let parent = parts.0.last_mut().expect("infallible");
                 let left = parts.1.first_mut().unwrap_or(&mut node);
-                let (pivot, klen, vlen) = left.pivot_for_split();
+                let (pivot, _klen, _vlen) = left.pivot_for_split();
 
                 if left.is_leaf() && left.entry_count() < HEURISTIC_RESIZE_THRESHOLD {
                     // Instead of splitting, in this case we will resize the node
