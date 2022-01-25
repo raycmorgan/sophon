@@ -6,12 +6,13 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
 fuzz_target!(|data: u64| {
+    env_logger::init();
     do_it(data);
 });
 
 fn do_it(seed: u64) {
-    const MAX_KEY_LEN: usize = 128;
-    const MAX_VAL_LEN: usize = 256;
+    const MAX_KEY_LEN: usize = 1024;
+    const MAX_VAL_LEN: usize = 1024 * 2;
 
     // let mut seed_data = [0u8; 32];
     // seed_data[0..16].copy_from_slice(&seed.0.to_ne_bytes());

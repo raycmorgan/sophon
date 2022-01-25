@@ -1,4 +1,5 @@
 use crate::buffer_manager::swip::Swip;
+use log::trace;
 use memmap::MmapMut;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,6 +133,8 @@ impl BufferManager {
         let mut guard: PageGuard<T> = PageGuard::new_exclusive(swip);
         guard.set_backing_len(page_class.page_size - PAGE_DATA_RESERVED);
         std::mem::drop(guard);
+
+        trace!("[new_page] {} {:?}", page_class.page_size, swip);
 
         Ok(swip)
     }

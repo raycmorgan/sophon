@@ -1,7 +1,8 @@
 use std::alloc::{Allocator, Global};
+use std::assert_matches::debug_assert_matches;
 use std::mem::size_of;
 
-use log::debug;
+use log::{debug, trace};
 use stackvec::StackVec;
 
 use crate::buffer_manager::swip::OptimisticError;
@@ -138,6 +139,7 @@ impl<'a> BTree<'a> {
                 }
             }
 
+            trace!("TRYING BASE INSERT");
             match node.insert(&key, &value) {
                 Ok(()) => {
                     return info;
@@ -149,7 +151,7 @@ impl<'a> BTree<'a> {
             // split or resize.
 
             if path.len() == 0 {
-                debug!("SPLIT ROOT #1");
+                trace!("SPLIT ROOT #1");
 
                 let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                 let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
@@ -207,7 +209,7 @@ impl<'a> BTree<'a> {
                 } else if parents == path_len {
                     // we need to split the root!
 
-                    debug!("SPLIT ROOT #2");
+                    trace!("SPLIT ROOT #2");
 
                     let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                     let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
@@ -254,6 +256,7 @@ impl<'a> BTree<'a> {
                 let parent = parts.0.last().expect("infallible");
                 let left = parts.1.first().unwrap_or(&node);
 
+                
                 debug_assert!(parent.contains(left),
                     "Mismatched fences between parent and child.\nKey: {:?}\nParent: {:?}\nLeft: {:?}\n\nPath: {:?}\nNode:{:?}\nInfo: {:?}",
                     key, parent, left, parts, node, info);
@@ -264,16 +267,26 @@ impl<'a> BTree<'a> {
 
                 if left.is_leaf() && left.entry_count() < HEURISTIC_RESIZE_THRESHOLD {
                     // Instead of splitting, in this case we will resize the node
-                    let mut new_node = self.resize_node(node, key, value);
+                    let mut new_node = self.resize_node(left, key, value);
+                    // TODO: release left
                     new_node.insert(key, value).expect("Space to now exist");
+
+                    trace!("RESIZE NODE: {:?}", new_node);
 
                     // This is actually not correct. Given at this point we only know if the parent
                     // has space for the pivot key, not re-entering the left node's lower fence!!
                     parent.insert_inner(&new_node).unwrap();
                     info.try_push(InsertInfo::ResizedPage(new_node.pid())).expect("infallible");
 
+                    debug_assert_eq!(
+                        parent.get_next(new_node.lower_fence()).unwrap(),
+                        new_node.swip_bytes(),
+                    );
+
                     return info;
                 }
+
+                trace!("SPLIT NODE: {:?}", left);
 
                 // TODO(safety): handle error
                 let right_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(left.data_capacity()).unwrap();
@@ -282,9 +295,17 @@ impl<'a> BTree<'a> {
                     .expect("infallible");
 
                 left.split(&mut right, pivot);
+                debug_assert_eq!(right.lower_fence(), left.upper_fence());
+                debug_assert!(right.upper_fence() == &[] || left.lower_fence() < right.upper_fence());
                 info.try_push(InsertInfo::SplitPage(left.pid())).expect("infallible");
 
                 parent.insert_inner(&right).expect("infallible");
+
+                debug_assert_eq!(
+                    parent.get_next(right.lower_fence()).unwrap(),
+                    right.swip_bytes(),
+                );
+
                 parent.downgrade();
 
                 if !left.is_leaf() {
@@ -295,39 +316,22 @@ impl<'a> BTree<'a> {
                     continue;
                 } else {
                     if key < left.upper_fence() {
+                        trace!("SPLIT NODE LEAF INSERT LEFT");
                         left.insert(key, value).unwrap();
                     } else {
+                        trace!("SPLIT NODE LEAF INSERT RIGHT");
                         right.insert(key, value).unwrap();
                     }
 
                     return info;
                 }
-
-
-
-                
-
-                // if !left.is_leaf() && key >= left.upper_fence() {
-                //     path[i + 1] = right;
-                // } else if left.is_leaf() {
-                //     if key < left.upper_fence() {
-                //         debug_assert!(left.shares_prefix(key));
-                //         left.insert(key, value).expect("Space to now exist");
-                //     } else {
-                //         debug_assert!(right.shares_prefix(key));
-                //         debug_assert!(key >= right.lower_fence());
-                //         right.insert(key, value).expect("Space to now exist");
-                //     }
-
-                //     return info;
-                // }
             }
 
             unreachable!();
         }
     }
 
-    fn resize_node(&self, node: PageGuard<Node>, key: &[u8], value: &[u8]) -> PageGuard<Node> {
+    fn resize_node(&self, node: &mut PageGuard<Node>, key: &[u8], value: &[u8]) -> PageGuard<Node> {
         let required_space = node.capacity_with(key, value);
         let new_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(required_space).unwrap();
 
@@ -336,7 +340,9 @@ impl<'a> BTree<'a> {
             .expect("infallible");
 
         node.clone_to(&mut new_node);
-        // TODO: release node
+
+        debug_assert_eq!(node.lower_fence(), new_node.lower_fence());
+        debug_assert_eq!(node.upper_fence(), new_node.upper_fence());
 
         new_node
     }
@@ -363,7 +369,7 @@ impl<'a> BTree<'a> {
     /// Returned PageGuard is returned locked via `strategy`
     /// Returned PageGuards in GuardPath are Optimistic
     fn search_to_leaf(&self, key: &[u8], strategy: LatchStrategy) -> (PageGuard<Node>, GuardPath) {
-        debug!("search_to_leaf: {:?}", key);
+        trace!("search_to_leaf: {:?}", key);
 
         'restart: loop {
             let mut path: GuardPath = Default::default();
@@ -383,6 +389,11 @@ impl<'a> BTree<'a> {
                         parent,
                         node
                     );
+
+                    debug_assert_eq!(
+                        parent.get(node.lower_fence()).unwrap(),
+                        &swip.value_bytes()[..]
+                    );
                 }
 
                 if node.is_leaf() {
@@ -391,6 +402,8 @@ impl<'a> BTree<'a> {
                         Ok(n) => n,
                         Err(OptimisticError::Conflict) => continue 'restart,
                     };
+
+                    trace!("[search_to_leaf] {:?}\nNode: {:?}", path, node);
 
                     return (node, path);
                 } else {

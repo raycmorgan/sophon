@@ -3,6 +3,7 @@
 #![feature(new_uninit)]
 #![feature(allocator_api)]
 #![feature(assert_matches)]
+#![feature(slice_as_chunks)]
 
 pub mod btree;
 pub mod buffer_manager;
