@@ -12,6 +12,8 @@ use crate::buffer_manager::{
     Swipable,
 };
 
+use super::HEURISTIC_RESIZE_THRESHOLD;
+
 pub(crate) const MAX_KEY_LEN: usize = 4096;
 
 #[repr(C)]
@@ -165,10 +167,10 @@ impl Node {
         self.header.lower_fence = lowerf;
         self.header.upper_fence = upperf;
 
-        debug!(
-            "[init_header] lower fence: {:?}, upper fence: {:?}, prefix: {:?}",
-            lower_fence, upper_fence, prefix
-        );
+        // debug!(
+        //     "[init_header] lower fence: {:?}, upper fence: {:?}, prefix: {:?}",
+        //     lower_fence, upper_fence, prefix
+        // );
 
         self.assert_structure();
     }
@@ -465,11 +467,21 @@ impl Node {
     #[inline]
     /// Returns (pivot, key_len, value_len)
     pub(crate) fn pivot_for_split(&self) -> (usize, usize, usize) {
+        if self.is_leaf() && self.entry_count() < HEURISTIC_RESIZE_THRESHOLD {
+            // Special case: if the node is holding a small number of keys,
+            // instead of splitting, we will be resizing. In this case, the
+            // key is actually this node's lower fence as the resized node will
+            // have the same fences.
+            return (0, self.header.lower_fence.len as usize, 8);
+        }
+
         let pivot = (self.header.slot_count as usize) / 2;
         let pivot_slot = self.slots()[pivot];
 
         let key_len = (self.header.prefix_len + pivot_slot.key_len) as usize;
         let value_len = pivot_slot.data_len as usize;
+
+        trace!("{} Len: {}, pivot: {}", self.pid(), self.entry_count(), pivot);
 
         (pivot, key_len, value_len)
     }
@@ -728,6 +740,10 @@ impl Node {
             self.upper_fence(),
         );
 
+        trace!("{} Parent prefix len: {}. Right: {}. Left: {}. Pivot: {}, slots: {}",
+            self.pid(), self.prefix().len(), right.prefix().len(), left.prefix().len(),
+            pivot, self.entry_count());
+
         for (i, slot) in self.slots().iter().enumerate() {
             // Special case: if left/right are inner nodes, we will need to
             // set the value to the upper_swip
@@ -740,10 +756,10 @@ impl Node {
             let value = self.get_data_value(*slot);
 
             if i < pivot {
-                trace!("Insert left: {:?}, v({})", key, value.len());
+                trace!("Insert left: k({}), v({})", key.len(), value.len());
                 left.insert(key, value).expect("infallible");
             } else {
-                trace!("Insert right: {:?}, v({})", key, value.len());
+                trace!("Insert right: k({}), v({})", key.len(), value.len());
                 right.insert(key, value).expect("infallible");
             }
         }
@@ -922,7 +938,7 @@ impl Node {
     }
 
     #[inline]
-    fn available_space(&self) -> usize {
+    pub(crate) fn available_space(&self) -> usize {
         self.header.data_capacity as usize
             - self.header.space_used as usize
     }

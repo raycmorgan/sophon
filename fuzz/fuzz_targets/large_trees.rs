@@ -6,7 +6,7 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
 fuzz_target!(|data: u64| {
-    env_logger::init();
+    // env_logger::init();
     do_it(data);
 });
 

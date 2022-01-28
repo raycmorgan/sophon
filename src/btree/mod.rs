@@ -5,6 +5,7 @@ use std::mem::size_of;
 use log::{debug, trace};
 use stackvec::StackVec;
 
+use crate::btree::node::InsertError;
 use crate::buffer_manager::swip::OptimisticError;
 use crate::buffer_manager::{
     buffer_frame::{LatchStrategy, PageGuard},
@@ -211,6 +212,8 @@ impl<'a> BTree<'a> {
 
                     trace!("SPLIT ROOT #2");
 
+                    let (pivot, _klen, _vlen) = parent.pivot_for_split();
+
                     let right_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
                     let left_swip: Swip<Node> = self.buffer_manager.new_page().unwrap();
 
@@ -263,18 +266,18 @@ impl<'a> BTree<'a> {
 
                 let parent = parts.0.last_mut().expect("infallible");
                 let left = parts.1.first_mut().unwrap_or(&mut node);
-                let (pivot, _klen, _vlen) = left.pivot_for_split();
 
                 if left.is_leaf() && left.entry_count() < HEURISTIC_RESIZE_THRESHOLD {
                     // Instead of splitting, in this case we will resize the node
                     let mut new_node = self.resize_node(left, key, value);
                     // TODO: release left
+
+                    trace!("INSERT AFTER RESIZE. k({}), v({}), remainder: {}", 
+                        key.len(), value.len(), new_node.available_space());
                     new_node.insert(key, value).expect("Space to now exist");
 
                     trace!("RESIZE NODE: {:?}", new_node);
 
-                    // This is actually not correct. Given at this point we only know if the parent
-                    // has space for the pivot key, not re-entering the left node's lower fence!!
                     parent.insert_inner(&new_node).unwrap();
                     info.try_push(InsertInfo::ResizedPage(new_node.pid())).expect("infallible");
 
@@ -285,6 +288,8 @@ impl<'a> BTree<'a> {
 
                     return info;
                 }
+
+                let (pivot, _klen, _vlen) = left.pivot_for_split();
 
                 trace!("SPLIT NODE: {:?}", left);
 
@@ -316,11 +321,36 @@ impl<'a> BTree<'a> {
                     continue;
                 } else {
                     if key < left.upper_fence() {
-                        trace!("SPLIT NODE LEAF INSERT LEFT");
-                        left.insert(key, value).unwrap();
+                        // TODO: It is not guaranteed that LEFT is large enough.
+                        // Given:
+                        //  LEFT holds > 6 keys, and thus was split
+                        //  New key:value is large enough in which it doesn't fit
+                        //  Notably, if LEFT is left weighted large keys, left might
+                        //  still be huge.
+                        //  Even if we select a pivot based on space (which we should do),
+                        //  This will still be an issue if new key:value >= 50% of the
+                        //  capacity of the node.
+                        //
+                        //  We also cannot just resize and insert into parent, as the parent
+                        //  may not have space :/
+                        //
+                        // Cheat by restarting, non-optimized
+
+                        match left.insert(key, value) {
+                            Ok(()) => trace!("SPLIT NODE LEAF INSERT LEFT"),
+                            Err(InsertError::InsufficientSpace) => {
+                                trace!("SPLIT NODE LEAF INSERT LEFT -- FAILED, RESTARTING");
+                                continue 'restart;
+                            }
+                        };
                     } else {
-                        trace!("SPLIT NODE LEAF INSERT RIGHT");
-                        right.insert(key, value).unwrap();
+                        match right.insert(key, value) {
+                            Ok(()) => trace!("SPLIT NODE LEAF INSERT RIGHT"),
+                            Err(InsertError::InsufficientSpace) => {
+                                trace!("SPLIT NODE LEAF INSERT RIGHT -- FAILED, RESTARTING");
+                                continue 'restart;
+                            }
+                        }
                     }
 
                     return info;
@@ -333,7 +363,8 @@ impl<'a> BTree<'a> {
 
     fn resize_node(&self, node: &mut PageGuard<Node>, key: &[u8], value: &[u8]) -> PageGuard<Node> {
         let required_space = node.capacity_with(key, value);
-        let new_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(required_space).unwrap();
+        let buffered_space = (required_space as f64 * 1.3) as usize;
+        let new_swip: Swip<Node> = self.buffer_manager.new_page_with_capacity(buffered_space).unwrap();
 
         let mut new_node = new_swip
             .coupled_page_guard::<Node>(None, LatchStrategy::Exclusive)
