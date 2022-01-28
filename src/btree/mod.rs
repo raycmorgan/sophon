@@ -1,5 +1,4 @@
 use std::alloc::{Allocator, Global};
-use std::assert_matches::debug_assert_matches;
 use std::mem::size_of;
 
 use log::{debug, trace};
@@ -203,7 +202,7 @@ impl<'a> BTree<'a> {
                 }
 
                 // let child = path.get(path_len - parents - 1).unwrap_or(&node);
-                let (pivot, klen, _vlen) = child.pivot_for_split();
+                let (_pivot, klen, _vlen) = child.pivot_for_split();
 
                 if parent.has_space_for(klen, size_of::<u64>()) {
                     break;
